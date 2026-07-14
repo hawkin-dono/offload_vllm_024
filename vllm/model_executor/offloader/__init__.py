@@ -10,6 +10,7 @@ from vllm.model_executor.offloader.base import (
     set_offloader,
     should_pin_memory,
 )
+from vllm.model_executor.offloader.expert_cache import ExpertCacheOffloader
 from vllm.model_executor.offloader.prefetch import PrefetchOffloader
 from vllm.model_executor.offloader.uva import UVAOffloader
 
@@ -18,6 +19,7 @@ __all__ = [
     "NoopOffloader",
     "UVAOffloader",
     "PrefetchOffloader",
+    "ExpertCacheOffloader",
     "create_offloader",
     "get_offloader",
     "set_offloader",

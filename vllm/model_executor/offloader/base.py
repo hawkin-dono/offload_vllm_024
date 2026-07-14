@@ -130,6 +130,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     selects prefetch if ``offload_group_size > 0``, UVA if
     ``cpu_offload_gb > 0``, otherwise noop.
     """
+    from vllm.model_executor.offloader.expert_cache import ExpertCacheOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
@@ -138,6 +139,8 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     prefetch = offload_config.prefetch
 
     if backend == "auto":
+        # "expert_cache" is never auto-selected: it only offloads routed expert
+        # weights and requires an MoE model, so it has to be asked for.
         if prefetch.offload_group_size > 0:
             backend = "prefetch"
         elif uva.cpu_offload_gb > 0:
@@ -145,7 +148,13 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
         else:
             return NoopOffloader()
 
-    if backend == "prefetch":
+    if backend == "expert_cache":
+        expert_cache = offload_config.expert_cache
+        return ExpertCacheOffloader(
+            expert_cache_params=expert_cache.expert_cache_params,
+            num_cache_slots=expert_cache.num_cache_slots,
+        )
+    elif backend == "prefetch":
         return PrefetchOffloader(
             group_size=prefetch.offload_group_size,
             num_in_group=prefetch.offload_num_in_group,

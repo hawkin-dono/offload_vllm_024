@@ -27,6 +27,7 @@ from vllm.config.model import (
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.offload import (
+    ExpertCacheOffloadConfig,
     OffloadBackend,
     OffloadConfig,
     PrefetchOffloadConfig,
@@ -99,6 +100,7 @@ __all__ = [
     # From vllm.config.observability
     "ObservabilityConfig",
     # From vllm.config.offload
+    "ExpertCacheOffloadConfig",
     "OffloadBackend",
     "OffloadConfig",
     "PrefetchOffloadConfig",

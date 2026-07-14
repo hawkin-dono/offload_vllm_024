@@ -320,19 +320,45 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
+
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+        global_num_experts = layer.global_num_experts
+        expert_map = layer.expert_map
+
+        # When expert weights are offloaded, the kernel runs against the GPU
+        # cache instead: `resolve` stages whatever this layer routes to and
+        # rewrites topk_ids from global expert ids into cache slots.
+        expert_cache = getattr(layer, "expert_cache", None)
+        if expert_cache is not None:
+            buffer, topk_ids = expert_cache.resolve(layer, topk_ids)
+            w13_weight = buffer.params["w13_weight"]
+            w2_weight = buffer.params["w2_weight"]
+            # topk_ids now index the buffer, so the expert space the kernel sees
+            # *is* the buffer. expert_map is a global->local EP mapping, which
+            # would double-map these ids; the cache rejects EP at load time.
+            global_num_experts = expert_cache.num_slots
+            expert_map = None
+
+        out = self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
+            w1=w13_weight,
+            w2=w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+        if expert_cache is not None:
+            # Hand the buffer we just consumed over to the next layer's prefetch.
+            expert_cache.flip()
+
+        return out
 
     def forward_cuda(
         self,

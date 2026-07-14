@@ -1,0 +1,85 @@
+# Flattened requirements for installing vLLM's Python dependencies into a
+# conda environment (CUDA / NVIDIA GPU target). Generated from
+# requirements/common.txt + requirements/cuda.txt.
+#
+# Usage:
+#   conda create -n vllm python=3.12 -y
+#   conda activate vllm
+#   pip install -r requirements.txt
+#   pip install -e . --no-build-isolation   # build/install vLLM itself
+
+# ---- common.txt ----
+regex # Replace re for higher-performance regex matching
+cachetools
+psutil
+sentencepiece  # Required for LLaMA tokenizer.
+numpy
+requests >= 2.26.0
+tqdm
+blake3
+py-cpuinfo
+transformers >= 5.5.3
+tokenizers >= 0.21.1  # Required for fast incremental detokenization.
+safetensors >= 0.6.2  # MXFP4/MXFP6 dtype support (F8_E8M0, F4) added in 0.6.0: https://github.com/huggingface/safetensors/pull/611
+protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, !=6.33.4.* # Required by LlamaTokenizer, gRPC. CVE-2026-0994
+fastapi[standard] >= 0.133.0, < 0.137.0
+starlette >= 1.0.1 # CVE-2026-48710: Host header injection in < 1.0.1
+aiohttp >= 3.13.3
+openai >= 2.0.0  # For Responses API with reasoning content
+pydantic >= 2.12.0
+prometheus_client >= 0.18.0
+pillow  # Required for image processing
+prometheus-fastapi-instrumentator >= 8.0.0
+tiktoken >= 0.6.0  # Required for DBRX tokenizer
+lm-format-enforcer == 0.11.3
+llguidance >= 1.7.0, < 1.8.0; platform_machine == "x86_64" or platform_machine == "arm64" or platform_machine == "aarch64" or platform_machine == "ppc64le"
+outlines_core == 0.2.14
+diskcache == 5.6.3
+lark == 1.2.2
+xgrammar >= 0.2.1, < 1.0.0; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "arm64" or platform_machine == "s390x" or platform_machine == "ppc64le"
+typing_extensions >= 4.10
+filelock >= 3.16.1
+partial-json-parser
+jsonschema >= 4.23.0
+pyzmq >= 25.0.0
+msgspec
+mistral_common[image] >= 1.11.3
+opencv-python-headless >= 4.13.0
+pyyaml
+six>=1.16.0; python_version > '3.11'
+setuptools>=77.0.3,<81.0.0; python_version > '3.11'
+einops # Required for Qwen2-VL.
+compressed-tensors == 0.17.0
+depyf==0.20.0
+cloudpickle
+watchfiles
+python-json-logger
+ninja
+pybase64
+cbor2
+ijson
+setproctitle
+openai-harmony >= 0.0.3
+anthropic >= 0.71.0
+model-hosting-container-standards >= 0.1.14, < 1.0.0
+mcp
+opentelemetry-sdk >= 1.27.0
+opentelemetry-api >= 1.27.0
+opentelemetry-exporter-otlp >= 1.27.0
+opentelemetry-semantic-conventions-ai >= 0.4.1
+
+# ---- cuda.txt (NVIDIA GPU deps) ----
+numba == 0.65.0 # Required for N-gram speculative decoding
+torch==2.11.0
+torchaudio==2.11.0
+torchvision==0.26.0 # Required for phi3v processor
+flashinfer-python==0.6.12
+flashinfer-cubin==0.6.12
+apache-tvm-ffi==0.1.9
+tilelang==0.1.9
+nvidia-cudnn-frontend>=1.19.1
+fastsafetensors >= 0.3.2
+nvidia-cutlass-dsl[cu13]==4.5.2
+quack-kernels>=0.3.3
+tokenspeed-mla==0.1.2
+humming-kernels[cu13]==0.1.6

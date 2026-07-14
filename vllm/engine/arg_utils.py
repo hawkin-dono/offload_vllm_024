@@ -42,6 +42,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EPLBConfig,
+    ExpertCacheOffloadConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -520,6 +521,11 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    expert_cache_params: set[str] = get_field(
+        ExpertCacheOffloadConfig, "expert_cache_params"
+    )
+    num_cache_slots: int = ExpertCacheOffloadConfig.num_cache_slots
+    expert_predictor_dir: str = ExpertCacheOffloadConfig.expert_predictor_dir
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1196,6 +1202,7 @@ class EngineArgs:
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
+        expert_cache_kwargs = get_kwargs(ExpertCacheOffloadConfig)
         offload_group = parser.add_argument_group(
             title="OffloadConfig",
             description=OffloadConfig.__doc__,
@@ -1221,6 +1228,15 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+        offload_group.add_argument(
+            "--expert-cache-params", **expert_cache_kwargs["expert_cache_params"]
+        )
+        offload_group.add_argument(
+            "--num-cache-slots", **expert_cache_kwargs["num_cache_slots"]
+        )
+        offload_group.add_argument(
+            "--expert-predictor-dir", **expert_cache_kwargs["expert_predictor_dir"]
         )
 
         # Multimodal related configs
@@ -2307,6 +2323,11 @@ class EngineArgs:
                 offload_num_in_group=self.offload_num_in_group,
                 offload_prefetch_step=self.offload_prefetch_step,
                 offload_params=self.offload_params,
+            ),
+            expert_cache=ExpertCacheOffloadConfig(
+                expert_cache_params=self.expert_cache_params,
+                num_cache_slots=self.num_cache_slots,
+                expert_predictor_dir=self.expert_predictor_dir,
             ),
         )
 

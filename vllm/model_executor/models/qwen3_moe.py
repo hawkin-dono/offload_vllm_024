@@ -43,6 +43,11 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.expert_prefetch import (
+    ATTN_INPUT,
+    MOE_INPUT,
+    maybe_create_expert_prefetcher,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
@@ -391,6 +396,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -419,12 +425,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Set by Qwen3MoeModel when expert offloading is enabled; None otherwise.
+        prefetcher = getattr(self, "expert_prefetcher", None)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if prefetcher is not None:
+            # `residual` is this layer's raw, pre-norm input. Predicting from it
+            # here lets the next layer's experts stream in over the whole
+            # attention block.
+            prefetcher.maybe_prefetch(self.layer_idx, residual, ATTN_INPUT)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -432,6 +448,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if prefetcher is not None:
+            # The router's own input: a better signal than the attention input,
+            # but it only leaves the MoE block itself to overlap the copies.
+            prefetcher.maybe_prefetch(self.layer_idx, hidden_states, MOE_INPUT)
+
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -467,6 +489,14 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+
+        # Expert offloading: predict and stage each MoE layer's experts from the
+        # previous layer. None unless the expert_cache offload backend is on.
+        self.expert_prefetcher = maybe_create_expert_prefetcher(vllm_config, self.layers)
+        if self.expert_prefetcher is not None:
+            for layer in self.layers:
+                layer.__dict__["expert_prefetcher"] = self.expert_prefetcher
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -504,6 +534,9 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
+
+        if self.expert_prefetcher is not None:
+            self.expert_prefetcher.on_forward_end()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

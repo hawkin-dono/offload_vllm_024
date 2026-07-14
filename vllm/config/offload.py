@@ -9,7 +9,7 @@ from pydantic import Field, model_validator
 
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "expert_cache"]
 
 
 @config
@@ -77,6 +77,55 @@ class PrefetchOffloadConfig:
 
 
 @config
+class ExpertCacheOffloadConfig:
+    """Configuration for ping-pong expert-cache CPU offloading.
+
+    Keeps routed MoE expert weights in pinned CPU memory and stages only the
+    experts a layer actually needs into a small GPU cache. Unlike the other
+    backends, staging is driven by the MoE forward path (predicted prefetch
+    plus fetch-on-demand), not by a module forward hook.
+    """
+
+    expert_cache_params: set[str] = Field(
+        default_factory=lambda: {
+            "routed_experts.w13_weight",
+            "routed_experts.w2_weight",
+        }
+    )
+    """The set of parameter name segments to keep in CPU memory. Uses the same
+    segment matching as `cpu_offload_params`: "routed_experts.w13_weight"
+    matches "...mlp.experts.routed_experts.w13_weight" but not
+    "...routed_experts.w13_weight_scale".
+
+    Expert bias is deliberately absent: the fused kernel indexes it by expert id
+    while the cached path passes slot indices, so MoE layers with bias are
+    rejected at load time rather than cached.
+    """
+
+    num_cache_slots: int = Field(default=0, ge=0)
+    """Number of expert slots in each of the two (ping/pong) GPU buffers.
+    Default 0 means one slot per expert, i.e. a buffer can hold a whole layer.
+    Lowering this trades GPU memory for a higher chance of a cache miss (which
+    costs a synchronous fetch-on-demand), and must be at least as large as the
+    number of distinct experts a single forward pass routes to.
+    """
+
+    expert_predictor_dir: str = ""
+    """Directory of trained expert-predictor checkpoints, named
+    `{input_type}_layer_{first}_{last}.ckpt`. Each predicts, from layer i's
+    hidden state, which experts layer i+1 will route to, so they can be
+    prefetched a full layer ahead.
+
+    Empty (the default) disables prediction: experts are then fetched on demand
+    when the MoE layer discovers it needs them. That is correct but synchronous,
+    and is the baseline prediction is measured against.
+
+    How many experts each prediction stages is not configured here -- it is
+    `ExpertPredictor.prefetch_top_k`, tuned at runtime.
+    """
+
+
+@config
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -84,8 +133,10 @@ class OffloadConfig:
     """The backend for weight offloading. Options:
     - "auto": Selects based on which sub-config has non-default values
       (prefetch if offload_group_size > 0, uva if cpu_offload_gb > 0).
+      Never selects "expert_cache", which must be requested explicitly.
     - "uva": UVA (Unified Virtual Addressing) zero-copy offloading.
     - "prefetch": Async prefetch with group-based layer offloading.
+    - "expert_cache": Ping-pong GPU cache for routed MoE expert weights.
     """
 
     uva: UVAOffloadConfig = Field(default_factory=UVAOffloadConfig)
@@ -93,6 +144,11 @@ class OffloadConfig:
 
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
+
+    expert_cache: ExpertCacheOffloadConfig = Field(
+        default_factory=ExpertCacheOffloadConfig
+    )
+    """Parameters for the expert-cache offloading backend."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
