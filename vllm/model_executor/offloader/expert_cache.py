@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.expert_prefetch.expert_quant import (
+    QUANT_STORE_ATTR,
+    SUPPORTED_EXPERT_QUANT_BITS,
+    quantize_experts,
+)
 from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
 from vllm.utils.mem_utils import format_gib
 
@@ -35,13 +40,24 @@ class ExpertCacheOffloader(BaseOffloader):
             "...experts.routed_experts.w13_weight" but not "...w13_weight_scale".
         num_cache_slots: Experts per ping/pong GPU buffer. 0 means one slot per
             expert. Consumed by the MoE layer when it allocates the cache.
+        quant_bits: Bit width of the quantized CPU-side copy staged over PCIe.
+            0 keeps the weights in their original dtype.
+        quant_group_size: Scale group along the reduction dim, or -1 for one
+            scale per row. Only used when `quant_bits` is nonzero.
     """
 
     def __init__(
         self,
         expert_cache_params: set[str],
         num_cache_slots: int = 0,
+        quant_bits: int = 0,
+        quant_group_size: int = 128,
     ):
+        if quant_bits and quant_bits not in SUPPORTED_EXPERT_QUANT_BITS:
+            raise ValueError(
+                f"quant_bits={quant_bits} is not supported; expected 0 or one "
+                f"of {sorted(SUPPORTED_EXPERT_QUANT_BITS)}."
+            )
         if not expert_cache_params:
             raise ValueError(
                 "expert_cache_params is empty, so the expert_cache offload "
@@ -50,6 +66,8 @@ class ExpertCacheOffloader(BaseOffloader):
             )
         self.expert_cache_params = expert_cache_params
         self.num_cache_slots = num_cache_slots
+        self.quant_bits = quant_bits
+        self.quant_group_size = quant_group_size
         self.pin_memory = should_pin_memory()
         self.offloaded_bytes = 0
 
@@ -128,13 +146,58 @@ class ExpertCacheOffloader(BaseOffloader):
         which is exactly what the cache buffers have to mirror.
         """
         self._repin()
+        self._quantize_offloaded()
 
         for cache in self._caches:
             owner = cache.owner
             cache.allocate(
                 param_names=self.cached_param_names(owner),
                 default_num_slots=self.num_cache_slots,
+                quant_bits=self.quant_bits,
+                quant_group_size=self.quant_group_size,
             )
+
+    def _quantize_offloaded(self) -> None:
+        """Build the pinned quantized mirror of every offloaded expert weight.
+
+        Runs here rather than in `wrap_modules` for the same reason `_repin`
+        does: this is the first point at which the weights are in their final
+        runtime layout, which is what the mirror has to reproduce.
+        """
+        if not self.quant_bits:
+            return
+
+        device = torch.device(torch.cuda.current_device())
+        quantized_bytes = 0
+        for module, name in self._offloaded:
+            p = module.get_parameter(name)
+            # `module` is the decoder layer, but the cache looks the store up on
+            # the RoutedExperts that owns the parameter, by leaf name.
+            parent, _, leaf = name.rpartition(".")
+            store = quantize_experts(
+                p.data,
+                self.quant_bits,
+                self.quant_group_size,
+                device,
+                self.pin_memory,
+                name=leaf,
+            )
+            target = module.get_submodule(parent) if parent else module
+            # Through __dict__ so the store stays out of state_dict().
+            target.__dict__.setdefault(QUANT_STORE_ATTR, {})[leaf] = store
+            quantized_bytes += store.nbytes()
+
+        # The chunk buffers are freed, but the allocator still holds their
+        # reserved blocks, which would skew the later memory profiling.
+        torch.cuda.empty_cache()
+
+        logger.info(
+            "Expert cache: int%d store adds %s of pinned host memory (%.0f%% of "
+            "the original expert weights, which are kept)",
+            self.quant_bits,
+            format_gib(quantized_bytes),
+            100 * quantized_bytes / max(self.offloaded_bytes, 1),
+        )
 
     def _repin(self) -> None:
         if not self.pin_memory:

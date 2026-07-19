@@ -11,6 +11,11 @@ from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "expert_cache"]
 
+# 0 disables quantization of the CPU-side expert store. One width for the whole
+# model for now; the GPU staging ring is already sized so a per-expert choice
+# costs no extra memory (see `DequantStaging`).
+ExpertQuantBits = Literal[0, 2, 4, 8]
+
 
 @config
 class UVAOffloadConfig:
@@ -110,6 +115,36 @@ class ExpertCacheOffloadConfig:
     number of distinct experts a single forward pass routes to.
     """
 
+    expert_quant_bits: ExpertQuantBits = 0
+    """Bit width of the CPU-side copy of routed expert weights that is staged
+    over PCIe. Default 0 keeps them in their original dtype.
+
+    Setting this to 2, 4 or 8 stores a second, symmetric round-to-nearest copy
+    of each expert alongside the original and stages *that* across the bus,
+    unpacking it on the GPU into the same cache slots the MoE kernel already
+    reads. H2D traffic drops roughly 2x/4x/8x. In exchange pinned host memory
+    grows by that fraction of the expert weights (the originals are kept), and
+    accuracy takes the hit of uncalibrated RTN -- ~11% relative error on the
+    weights at int4, and far more at int2, where a group has four levels.
+    Evaluate before enabling; this is a model-quality change, not just a perf
+    one.
+
+    The GPU cost is fixed and small: the packed weights land in a shared
+    dequant ring of a few experts rather than a buffer per cache slot, so the
+    GPU cache stays the bf16 ping/pong plus ~150 MiB.
+    """
+
+    expert_quant_group_size: int = Field(default=128)
+    """Quantization group size along the reduction (last) dim of each expert
+    weight, or -1 for one scale per output row. Only used when
+    `expert_quant_bits` is nonzero.
+
+    The reduction dim -- `hidden_size` for w13_weight,
+    `intermediate_size_per_partition` for w2_weight -- must be divisible by
+    this. Note the latter is sharded by tensor parallelism, so a group size
+    that works at tp=1 can fail at tp=4; use -1 in that case.
+    """
+
     expert_predictor_dir: str = ""
     """Directory of trained expert-predictor checkpoints, named
     `{input_type}_layer_{first}_{last}.ckpt`. Each predicts, from layer i's
@@ -190,6 +225,24 @@ class OffloadConfig:
                 "Set offload_backend explicitly to suppress this warning.",
                 stacklevel=2,
             )
+
+        if self.expert_cache.expert_quant_bits:
+            group_size = self.expert_cache.expert_quant_group_size
+            # A group must not straddle a byte boundary, and a byte holds
+            # 8 // bits values: 4 at int2, 2 at int4, 1 at int8.
+            per_byte = 8 // self.expert_cache.expert_quant_bits
+            if group_size != -1 and (group_size < per_byte or group_size % per_byte):
+                raise ValueError(
+                    f"expert_quant_group_size ({group_size}) must be -1 (one "
+                    f"scale per row) or a multiple of {per_byte} for "
+                    f"expert_quant_bits={self.expert_cache.expert_quant_bits}"
+                )
+            if self.offload_backend != "expert_cache":
+                warnings.warn(
+                    "expert_quant_bits is set but offload_backend is "
+                    f"'{self.offload_backend}'. It will be ignored.",
+                    stacklevel=2,
+                )
         return self
 
     def compute_hash(self) -> str:

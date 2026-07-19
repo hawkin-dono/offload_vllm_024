@@ -525,6 +525,8 @@ class EngineArgs:
         ExpertCacheOffloadConfig, "expert_cache_params"
     )
     num_cache_slots: int = ExpertCacheOffloadConfig.num_cache_slots
+    expert_quant_bits: int = ExpertCacheOffloadConfig.expert_quant_bits
+    expert_quant_group_size: int = ExpertCacheOffloadConfig.expert_quant_group_size
     expert_predictor_dir: str = ExpertCacheOffloadConfig.expert_predictor_dir
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
@@ -1234,6 +1236,13 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--num-cache-slots", **expert_cache_kwargs["num_cache_slots"]
+        )
+        offload_group.add_argument(
+            "--expert-quant-bits", **expert_cache_kwargs["expert_quant_bits"]
+        )
+        offload_group.add_argument(
+            "--expert-quant-group-size",
+            **expert_cache_kwargs["expert_quant_group_size"],
         )
         offload_group.add_argument(
             "--expert-predictor-dir", **expert_cache_kwargs["expert_predictor_dir"]
@@ -2327,6 +2336,8 @@ class EngineArgs:
             expert_cache=ExpertCacheOffloadConfig(
                 expert_cache_params=self.expert_cache_params,
                 num_cache_slots=self.num_cache_slots,
+                expert_quant_bits=self.expert_quant_bits,
+                expert_quant_group_size=self.expert_quant_group_size,
                 expert_predictor_dir=self.expert_predictor_dir,
             ),
         )
