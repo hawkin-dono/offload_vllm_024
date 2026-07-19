@@ -526,6 +526,7 @@ class EngineArgs:
     )
     num_cache_slots: int = ExpertCacheOffloadConfig.num_cache_slots
     expert_predictor_dir: str = ExpertCacheOffloadConfig.expert_predictor_dir
+    log_accuracy_interval: int = ExpertCacheOffloadConfig.log_accuracy_interval
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1237,6 +1238,9 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--expert-predictor-dir", **expert_cache_kwargs["expert_predictor_dir"]
+        )
+        offload_group.add_argument(
+            "--log-accuracy-interval", **expert_cache_kwargs["log_accuracy_interval"]
         )
 
         # Multimodal related configs
@@ -2328,6 +2332,7 @@ class EngineArgs:
                 expert_cache_params=self.expert_cache_params,
                 num_cache_slots=self.num_cache_slots,
                 expert_predictor_dir=self.expert_predictor_dir,
+                log_accuracy_interval=self.log_accuracy_interval,
             ),
         )
 

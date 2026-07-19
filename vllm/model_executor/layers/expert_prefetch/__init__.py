@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ping-pong GPU caching and predictive prefetching of routed MoE expert weights."""
 
+from vllm.model_executor.layers.expert_prefetch.accuracy_tracker import (
+    AccuracyTracker,
+)
 from vllm.model_executor.layers.expert_prefetch.expert_cache import (
     EMPTY_SLOT,
     ExpertBuffer,
@@ -22,6 +25,7 @@ __all__ = [
     "ATTN_INPUT",
     "EMPTY_SLOT",
     "MOE_INPUT",
+    "AccuracyTracker",
     "ExpertBuffer",
     "ExpertCache",
     "ExpertPredictor",

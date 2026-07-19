@@ -179,7 +179,7 @@ class ExpertPredictor(nn.Module):
 
         self.top_k = top_ks.pop()
         self.num_experts = expert_counts.pop()
-        self._prefetch_top_k = prefetch_top_k or max(1, int(self.top_k * 0.7))
+        self._prefetch_top_k = prefetch_top_k or max(1, int(self.top_k))
 
         self.to(device=device, dtype=dtype)
         logger.info(

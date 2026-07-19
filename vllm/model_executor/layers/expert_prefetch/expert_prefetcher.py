@@ -74,6 +74,10 @@ class ExpertPrefetcher:
 
     def on_forward_end(self) -> None:
         """Drop staged state so the next forward pass starts cold."""
+        if self.cache.accuracy is not None:
+            # The one point in the pass where reading the counters is safe: no
+            # MoE layer is waiting on the sync it may cost.
+            self.cache.accuracy.on_forward_end()
         self.cache.reset()
 
 
@@ -98,12 +102,15 @@ def maybe_create_expert_prefetcher(
     Returns None when the expert_cache offload backend is not active, leaving
     the model on the stock fully-GPU-resident path.
     """
+    offload_config = vllm_config.offload_config.expert_cache
     moe_layers = _collect_moe_layers(layers)
-    cache = maybe_create_expert_cache(list(moe_layers.values()))
+    cache = maybe_create_expert_cache(
+        list(moe_layers.values()),
+        log_accuracy_interval=offload_config.log_accuracy_interval,
+    )
     if cache is None:
         return None
 
-    offload_config = vllm_config.offload_config.expert_cache
     predictor: ExpertPredictor | None = None
     if offload_config.expert_predictor_dir:
         model_config = vllm_config.model_config

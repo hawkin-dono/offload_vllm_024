@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.expert_prefetch.accuracy_tracker import AccuracyTracker
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -39,6 +40,7 @@ EMPTY_SLOT = -1
 
 def maybe_create_expert_cache(
     routed_experts: list["RoutedExperts"],
+    log_accuracy_interval: int = 0,
 ) -> "ExpertCache | None":
     """Build the shared cache for a model's MoE layers, if the expert_cache
     offload backend is active. Returns None otherwise, leaving the model on the
@@ -50,7 +52,7 @@ def maybe_create_expert_cache(
     if not isinstance(offloader, ExpertCacheOffloader) or not routed_experts:
         return None
 
-    cache = ExpertCache()
+    cache = ExpertCache(log_accuracy_interval=log_accuracy_interval)
     cache.bind(routed_experts)
     # Buffers are allocated later, from the offloader's post_init: expert
     # weights are not in their final runtime layout until then.
@@ -143,10 +145,11 @@ class ExpertCache:
     `RoutedExperts`, and the MoE forward reaches it via `layer.expert_cache`.
     """
 
-    def __init__(self, num_cache_slots: int = 0):
+    def __init__(self, num_cache_slots: int = 0, log_accuracy_interval: int = 0):
         # 0 means "size to hold a whole layer" — resolved in `allocate`, once we
         # can see the expert weights.
         self._requested_slots = num_cache_slots
+        self._log_accuracy_interval = log_accuracy_interval
         self.param_names: tuple[str, ...] = ()
         self.num_slots = 0
         self.allocated = False
@@ -163,9 +166,8 @@ class ExpertCache:
         )
 
         # Prefetch accuracy: of the experts a layer turned out to need, how many
-        # were already staged. Allocated with the buffers, on the GPU.
-        self._hits: torch.Tensor = torch.zeros((), dtype=torch.long)
-        self._needed: torch.Tensor = torch.zeros((), dtype=torch.long)
+        # were already staged. Built in `bind`, once the layers are known.
+        self.accuracy: AccuracyTracker | None = None
 
     @property
     def owner(self) -> "RoutedExperts":
@@ -206,6 +208,10 @@ class ExpertCache:
         if not routed_experts:
             raise ValueError("ExpertCache.bind requires at least one MoE layer.")
         self._owner = routed_experts[0]
+        self.accuracy = AccuracyTracker(
+            [layer.layer_name for layer in routed_experts],
+            log_interval=self._log_accuracy_interval,
+        )
         for layer in routed_experts:
             # Bypass nn.Module.__setattr__ so the shared cache does not become a
             # submodule of every layer (which would duplicate it in state_dict,
@@ -248,8 +254,8 @@ class ExpertCache:
         device = torch.device(torch.cuda.current_device())
         self.ping.allocate(owner, num_slots, device)
         self.pong.allocate(owner, num_slots, device)
-        self._hits = torch.zeros((), dtype=torch.long, device=device)
-        self._needed = torch.zeros((), dtype=torch.long, device=device)
+        if self.accuracy is not None:
+            self.accuracy.allocate(device)
         self.allocated = True
 
         bytes_per_buffer = sum(
@@ -269,12 +275,11 @@ class ExpertCache:
         were fetched on demand (which is what you get with no predictor). Forces
         a device sync, so read it between forward passes, not inside one.
         """
-        needed = int(self._needed)
-        return float(self._hits) / needed if needed else 0.0
+        return self.accuracy.hit_rate() if self.accuracy is not None else 0.0
 
     def reset_stats(self) -> None:
-        self._hits.zero_()
-        self._needed.zero_()
+        if self.accuracy is not None:
+            self.accuracy.reset()
 
     @property
     def active(self) -> ExpertBuffer:
@@ -327,9 +332,9 @@ class ExpertCache:
 
         hit = torch.isin(needed, slot_ids)
         # Accumulate on-device: reading these would force a sync, so the tally is
-        # kept on the GPU and only materialized by `hit_rate`.
-        self._hits += hit.sum()
-        self._needed += needed.numel()
+        # kept on the GPU and only materialized between forward passes.
+        if self.accuracy is not None:
+            self.accuracy.record(owner.layer_name, hit, needed.numel())
 
         if not bool(hit.all()):
             missing = needed[~hit]

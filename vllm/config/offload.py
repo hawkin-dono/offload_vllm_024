@@ -124,6 +124,15 @@ class ExpertCacheOffloadConfig:
     `ExpertPredictor.prefetch_top_k`, tuned at runtime.
     """
 
+    log_accuracy_interval: int = Field(default=0, ge=0)
+    """Log prefetch accuracy -- overall and per MoE layer -- every this many
+    forward passes. 0 (the default) disables the logging.
+
+    The counters themselves are always maintained: they are two device-side adds
+    per MoE layer, and are read back at most once per forward pass, so enabling
+    this costs a host sync between passes and nothing on the hot path.
+    """
+
 
 @config
 class OffloadConfig:
