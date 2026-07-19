@@ -120,9 +120,49 @@ class ExpertCacheOffloadConfig:
     when the MoE layer discovers it needs them. That is correct but synchronous,
     and is the baseline prediction is measured against.
 
-    How many experts each prediction stages is not configured here -- it is
-    `ExpertPredictor.prefetch_top_k`, tuned at runtime.
+    How many experts each prediction stages is decided at runtime by
+    `PrefetchController`; see `prefetch_topk` to pin it instead.
     """
+
+    prefetch_topk: int = Field(default=0, ge=0)
+    """How many experts per token to stage on each prediction.
+
+    Default 0 lets `PrefetchController` solve for it from measured prediction
+    accuracy and copy bandwidth, separately per batch-size bucket. Any other
+    value pins it and disables adaptation, which is what to use when comparing
+    against a fixed-size prefetch.
+    """
+
+    prefetch_confidence: float = Field(default=0.99)
+    """Confidence level for the Poisson bound on mispredicted experts.
+
+    The controller stages enough experts that, with this probability, it has not
+    left out one the layer will route to. Higher values stage more and waste
+    more bandwidth on predictions that turn out to be wrong. One of 0.95, 0.99,
+    0.999.
+    """
+
+    prefetch_adapt_interval: int = Field(default=32, ge=1)
+    """Forward passes between adaptation steps.
+
+    Also sets how often timing events are recorded: one pass per interval
+    carries them, and the step happens at the end of the interval so they have
+    had time to complete and are never blocked on.
+    """
+
+    prefetch_num_chunks: int = Field(default=4, ge=1)
+    """How many pieces to split a prefetch into.
+
+    The copy stream is drained between chunks so that fetch-on-demand -- issued
+    on the compute stream by a layer whose prediction missed -- gets the DMA
+    engine instead of queueing behind the entire prefetch. 1 disables chunking.
+    """
+
+    prefetch_ema_alpha: float = Field(default=0.2, gt=0, le=1)
+    """How fast the staged-expert count follows its target. Lower is steadier."""
+
+    prefetch_min_topk: int = Field(default=1, ge=1)
+    """Floor on the number of experts per token to stage."""
 
 
 @config
@@ -153,6 +193,15 @@ class OffloadConfig:
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        # Only these have a tabulated z-score; anything else would silently fall
+        # back to some other confidence level.
+        valid_confidences = (0.95, 0.99, 0.999)
+        if self.expert_cache.prefetch_confidence not in valid_confidences:
+            raise ValueError(
+                f"prefetch_confidence ({self.expert_cache.prefetch_confidence}) "
+                f"must be one of {valid_confidences}"
+            )
+
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
@@ -201,9 +250,26 @@ class OffloadConfig:
         into the computation graph. Changing any offload setting can
         alter which layers are hooked and how prefetch indices are
         computed, so the compilation cache must distinguish them.
+
+        The expert-cache prefetch policy knobs are the exception: they only
+        change how many expert weights get staged and when, never the traced
+        graph, so including them would invalidate the cache for nothing.
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        factors = get_hash_factors(self, ignored_factors=set())
+        factors = get_hash_factors(self, ignored_factors={"expert_cache"})
+        # `ignored_factors` only reaches top-level fields, so the expert-cache
+        # sub-config is re-added by hand with just its structural fields.
+        factors["expert_cache"] = get_hash_factors(
+            self.expert_cache,
+            ignored_factors={
+                "prefetch_topk",
+                "prefetch_confidence",
+                "prefetch_adapt_interval",
+                "prefetch_num_chunks",
+                "prefetch_ema_alpha",
+                "prefetch_min_topk",
+            },
+        )
         hash_str = hash_factors(factors)
         return hash_str

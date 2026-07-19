@@ -136,7 +136,6 @@ class ExpertPredictor(nn.Module):
         checkpoint_dir: str | Path,
         device: torch.device,
         dtype: torch.dtype,
-        prefetch_top_k: int = 0,
     ):
         super().__init__()
         checkpoint_dir = Path(checkpoint_dir)
@@ -179,36 +178,14 @@ class ExpertPredictor(nn.Module):
 
         self.top_k = top_ks.pop()
         self.num_experts = expert_counts.pop()
-        self._prefetch_top_k = prefetch_top_k or max(1, int(self.top_k * 0.7))
 
         self.to(device=device, dtype=dtype)
         logger.info(
-            "Expert predictor: %d layers from %s (top_k=%d, prefetching top-%d)",
+            "Expert predictor: %d layers from %s (model top_k=%d)",
             len(self.layer_to_input),
             checkpoint_dir,
             self.top_k,
-            self.prefetch_top_k,
         )
-
-    @property
-    def prefetch_top_k(self) -> int:
-        """How many experts per token to stage.
-
-        Tunable at runtime (by profiling, or an adaptive policy): predicting
-        fewer experts than the router will actually pick shrinks the prefetch
-        and the PCIe traffic with it, while the ones it gets wrong are still
-        served on demand. So this trades latency against bandwidth, and can be
-        moved freely between forward passes without affecting correctness.
-        """
-        return self._prefetch_top_k
-
-    @prefetch_top_k.setter
-    def prefetch_top_k(self, value: int) -> None:
-        if not 1 <= value <= self.num_experts:
-            raise ValueError(
-                f"prefetch_top_k must be in [1, {self.num_experts}], got {value}."
-            )
-        self._prefetch_top_k = value
 
     def input_type(self, layer_idx: int) -> str | None:
         """Which hidden state layer `layer_idx`'s predictor was trained on, or
@@ -217,11 +194,11 @@ class ExpertPredictor(nn.Module):
 
     @torch.inference_mode()
     def predict(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        """Experts that layer `layer_idx + 1` is likely to route to.
+        """Per-expert scores for layer `layer_idx + 1`, shape (..., num_experts).
 
-        Returns the union over the batch's tokens, as a 1-D tensor of global
-        expert ids.
+        Raw logits, deliberately: how many of them to act on is a bandwidth
+        decision that belongs to `PrefetchController`, and the scores are also
+        what lets the prefetcher rank candidates when the cache cannot hold them
+        all. Only the ordering is used, so no normalization is applied.
         """
-        logits = self._predictors[str(layer_idx)](hidden_states)
-        top = torch.topk(logits, self._prefetch_top_k, dim=-1).indices
-        return torch.unique(top.reshape(-1))
+        return self._predictors[str(layer_idx)](hidden_states)

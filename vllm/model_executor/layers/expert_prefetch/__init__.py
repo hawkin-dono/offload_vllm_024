@@ -17,6 +17,9 @@ from vllm.model_executor.layers.expert_prefetch.expert_prefetcher import (
     ExpertPrefetcher,
     maybe_create_expert_prefetcher,
 )
+from vllm.model_executor.layers.expert_prefetch.prefetch_controller import (
+    PrefetchController,
+)
 
 __all__ = [
     "ATTN_INPUT",
@@ -26,6 +29,7 @@ __all__ = [
     "ExpertCache",
     "ExpertPredictor",
     "ExpertPrefetcher",
+    "PrefetchController",
     "maybe_create_expert_cache",
     "maybe_create_expert_prefetcher",
 ]

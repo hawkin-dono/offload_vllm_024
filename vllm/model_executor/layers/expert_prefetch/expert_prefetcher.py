@@ -15,17 +15,21 @@ import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.expert_prefetch.expert_cache import (
+    LOG_ACCURACY,
     ExpertCache,
+    accuracy_tracker,
     maybe_create_expert_cache,
 )
 from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
-    ATTN_INPUT,
-    MOE_INPUT,
     ExpertPredictor,
+)
+from vllm.model_executor.layers.expert_prefetch.prefetch_controller import (
+    PrefetchController,
 )
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.offload import ExpertCacheOffloadConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 logger = init_logger(__name__)
@@ -39,12 +43,35 @@ class ExpertPrefetcher:
         cache: ExpertCache,
         predictor: ExpertPredictor | None,
         moe_layers: dict[int, "RoutedExperts"],
+        config: "ExpertCacheOffloadConfig | None" = None,
     ):
         self.cache = cache
         self.predictor = predictor
         self.moe_layers = moe_layers
+        self.config = config
+        self.num_chunks = config.prefetch_num_chunks if config else 1
         # Copies run here so they overlap the compute on the default stream.
         self.stream = torch.cuda.Stream()
+        # Built on first use: it needs the cache's slot count and a calibrated
+        # copy time, and neither exists until the offloader's `post_init` has
+        # allocated the buffers -- which happens after the model is constructed.
+        self.controller: PrefetchController | None = None
+        # The batch size this forward pass is running at. Fixed for the whole
+        # pass, so the controller's per-bucket state cannot be split across it.
+        self._num_tokens = 0
+        self._skipped = 0
+        self._resolved = 0
+
+    def _ensure_controller(self) -> PrefetchController | None:
+        if self.controller is None and self.config is not None and self.predictor:
+            self.controller = PrefetchController(
+                top_k=self.predictor.top_k,
+                num_experts=self.predictor.num_experts,
+                num_slots=self.cache.num_slots,
+                cfg=self.config,
+                t_e_ms=self.cache.calibrate_copy_time(),
+            )
+        return self.controller
 
     def maybe_prefetch(
         self,
@@ -69,13 +96,104 @@ class ExpertPrefetcher:
         if next_moe is None:
             return
 
-        expert_ids = self.predictor.predict(hidden_states.detach(), layer_idx)
-        self.cache.prefetch(next_moe, expert_ids, self.stream)
+        hidden_states = hidden_states.detach()
+        num_tokens = hidden_states.shape[0] if hidden_states.dim() > 1 else 1
+        controller = self._ensure_controller()
+        if self._num_tokens == 0:
+            self._num_tokens = num_tokens
+            self.cache.begin_forward(
+                sampling=controller is not None and controller.due_to_sample()
+            )
+
+        logits = self.predictor.predict(hidden_states, layer_idx)
+        top_k = self.predictor.top_k
+        prefetch_top_k = controller.topk_for(num_tokens) if controller else top_k
+
+        if LOG_ACCURACY:
+            logger.debug(
+                "Prefetching for layer %d, input %s, num_tokens=%d, top_k=%d, "
+                "prefetch_top_k=%d",
+                layer_idx,
+                input_type,
+                num_tokens,
+                top_k,
+                prefetch_top_k,
+            )
+        # Rank by predictor score, not by expert id: what does not fit the cache
+        # is dropped from the tail, and `torch.unique` would sort numerically and
+        # so drop by id -- a systematically biased subset rather than the least
+        # likely experts.
+        expert_ids = _rank_unique(logits, prefetch_top_k)
+
+        # The full top-`K` picks, for measuring accuracy only. Nothing is copied
+        # for these; the cache just intersects them with what the layer routed
+        # to, which is the accuracy the Poisson model is written in terms of.
+        reference_ids = None
+        if controller is not None and prefetch_top_k < top_k:
+            reference_ids = _rank_unique(logits, top_k)
+
+        self.cache.prefetch(
+            next_moe,
+            expert_ids,
+            self.stream,
+            num_chunks=self.num_chunks,
+            reference_ids=reference_ids,
+        )
 
     def on_forward_end(self) -> None:
-        """Drop staged state so the next forward pass starts cold."""
+        """Feed the controller this pass's measurements, then start cold."""
+        if LOG_ACCURACY:
+            accuracy_tracker.on_forward_end()
+        if self.controller is not None:
+            self._adapt()
+        self._num_tokens = 0
         self.cache.reset()
 
+    def _adapt(self) -> None:
+        assert self.controller is not None
+        stats = self.cache.drain_stats()
+        num_tokens = self._num_tokens
+        if num_tokens:
+            self.controller.observe(
+                num_tokens=num_tokens,
+                hits=stats.reference_hits,
+                needed=stats.needed,
+                staged=stats.staged,
+                layers=stats.layers,
+                truncated=stats.truncated,
+            )
+            for t_comp in stats.t_comp_ms:
+                self.controller.observe_t_comp(num_tokens, t_comp)
+        self.controller.observe_t_e(stats.t_e_ms)
+        self._skipped += stats.skipped
+        self._resolved += stats.layers + stats.skipped
+        if self.controller.on_forward_end():
+            self.controller.step()
+            logger.debug(
+                "%s | skipped=%d/%d", self.controller.summary(),
+                self._skipped, self._resolved,
+            )
+
+
+def _rank_unique(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """The union of each token's top-`top_k` experts, best-scoring first.
+
+    An expert is scored by its best score over the batch, so a prefix of the
+    result is always the most likely experts -- which is what makes truncating
+    it safe when the union outgrows the cache.
+    """
+    num_experts = logits.shape[-1]
+    top = torch.topk(logits, top_k, dim=-1)
+    ids = top.indices.reshape(-1)
+    # scores = top.values.reshape(-1).float()
+
+    # floor = torch.finfo(torch.float32).min
+    # best = torch.full((num_experts,), floor, device=logits.device)
+    # best.scatter_reduce_(0, ids, scores, reduce="amax", include_self=True)
+
+    # candidates = torch.nonzero(best > floor, as_tuple=True)[0]
+    # return candidates[torch.argsort(best[candidates], descending=True)]
+    return torch.unique(ids)
 
 def _collect_moe_layers(layers: nn.ModuleList) -> dict[int, "RoutedExperts"]:
     """Map decoder layer index -> its routed experts, skipping dense layers and
@@ -120,7 +238,18 @@ def maybe_create_expert_prefetcher(
             "--expert-predictor-dir to prefetch them."
         )
 
-    return ExpertPrefetcher(cache, predictor, moe_layers)
+    if predictor is not None and not vllm_config.model_config.enforce_eager:
+        # `resolve` reads expert ids back to the host to decide what to fetch,
+        # and the prefetch worker records events from another thread; neither is
+        # capturable. Without this the graph captures one forward's cache state
+        # and replays it forever, which is wrong rather than merely slow.
+        raise ValueError(
+            "The expert_cache offload backend requires --enforce-eager: the "
+            "cache makes host-side decisions inside the MoE forward, which "
+            "cannot be captured into a CUDA graph."
+        )
+
+    return ExpertPrefetcher(cache, predictor, moe_layers, offload_config)
 
 
 def _validate_predictor(

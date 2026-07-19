@@ -526,6 +526,12 @@ class EngineArgs:
     )
     num_cache_slots: int = ExpertCacheOffloadConfig.num_cache_slots
     expert_predictor_dir: str = ExpertCacheOffloadConfig.expert_predictor_dir
+    prefetch_topk: int = ExpertCacheOffloadConfig.prefetch_topk
+    prefetch_confidence: float = ExpertCacheOffloadConfig.prefetch_confidence
+    prefetch_adapt_interval: int = ExpertCacheOffloadConfig.prefetch_adapt_interval
+    prefetch_num_chunks: int = ExpertCacheOffloadConfig.prefetch_num_chunks
+    prefetch_ema_alpha: float = ExpertCacheOffloadConfig.prefetch_ema_alpha
+    prefetch_min_topk: int = ExpertCacheOffloadConfig.prefetch_min_topk
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1237,6 +1243,25 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--expert-predictor-dir", **expert_cache_kwargs["expert_predictor_dir"]
+        )
+        offload_group.add_argument(
+            "--prefetch-topk", **expert_cache_kwargs["prefetch_topk"]
+        )
+        offload_group.add_argument(
+            "--prefetch-confidence", **expert_cache_kwargs["prefetch_confidence"]
+        )
+        offload_group.add_argument(
+            "--prefetch-adapt-interval",
+            **expert_cache_kwargs["prefetch_adapt_interval"],
+        )
+        offload_group.add_argument(
+            "--prefetch-num-chunks", **expert_cache_kwargs["prefetch_num_chunks"]
+        )
+        offload_group.add_argument(
+            "--prefetch-ema-alpha", **expert_cache_kwargs["prefetch_ema_alpha"]
+        )
+        offload_group.add_argument(
+            "--prefetch-min-topk", **expert_cache_kwargs["prefetch_min_topk"]
         )
 
         # Multimodal related configs
@@ -2328,6 +2353,12 @@ class EngineArgs:
                 expert_cache_params=self.expert_cache_params,
                 num_cache_slots=self.num_cache_slots,
                 expert_predictor_dir=self.expert_predictor_dir,
+                prefetch_topk=self.prefetch_topk,
+                prefetch_confidence=self.prefetch_confidence,
+                prefetch_adapt_interval=self.prefetch_adapt_interval,
+                prefetch_num_chunks=self.prefetch_num_chunks,
+                prefetch_ema_alpha=self.prefetch_ema_alpha,
+                prefetch_min_topk=self.prefetch_min_topk,
             ),
         )
 
