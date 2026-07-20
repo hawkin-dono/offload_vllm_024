@@ -26,6 +26,7 @@ from vllm.model_executor.layers.expert_prefetch.expert_predictor import (
 from vllm.model_executor.layers.expert_prefetch.prefetch_controller import (
     PrefetchController,
 )
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -59,8 +60,6 @@ class ExpertPrefetcher:
         # The batch size this forward pass is running at. Fixed for the whole
         # pass, so the controller's per-bucket state cannot be split across it.
         self._num_tokens = 0
-        self._skipped = 0
-        self._resolved = 0
 
     def _ensure_controller(self) -> PrefetchController | None:
         if self.controller is None and self.config is not None and self.predictor:
@@ -101,15 +100,28 @@ class ExpertPrefetcher:
         controller = self._ensure_controller()
         if self._num_tokens == 0:
             self._num_tokens = num_tokens
+            # The controller only needs timings every `adapt_interval` passes,
+            # but the accuracy log prints every one, so accuracy tracking forces
+            # them on. That also feeds the controller more samples than it would
+            # otherwise get: LOG_ACCURACY already syncs per layer, so this is a
+            # debug mode either way, not a configuration to measure against.
             self.cache.begin_forward(
-                sampling=controller is not None and controller.due_to_sample()
+                sampling=LOG_ACCURACY
+                or (controller is not None and controller.due_to_sample())
             )
 
-        logits = self.predictor.predict(hidden_states, layer_idx)
+        # The predictor is two GEMMs and an activation -- microseconds, and
+        # nothing on a profile timeline names them. Without a scope it is
+        # indistinguishable from the model's own kernels on the same stream.
+        with record_function_or_nullcontext("expert_prefetch: predict"):
+            logits = self.predictor.predict(hidden_states, layer_idx)
         top_k = self.predictor.top_k
         prefetch_top_k = controller.topk_for(num_tokens) if controller else top_k
 
         if LOG_ACCURACY:
+            # Attributed to the layer being staged, so the summary can print it
+            # next to the hit rate that same layer goes on to report.
+            accuracy_tracker.record_topk(next_moe.layer_name, prefetch_top_k)
             logger.debug(
                 "Prefetching for layer %d, input %s, num_tokens=%d, top_k=%d, "
                 "prefetch_top_k=%d",
@@ -123,29 +135,36 @@ class ExpertPrefetcher:
         # is dropped from the tail, and `torch.unique` would sort numerically and
         # so drop by id -- a systematically biased subset rather than the least
         # likely experts.
-        expert_ids = _rank_unique(logits, prefetch_top_k)
+        with record_function_or_nullcontext("expert_prefetch: rank"):
+            expert_ids = _rank_unique(logits, prefetch_top_k)
 
-        # The full top-`K` picks, for measuring accuracy only. Nothing is copied
-        # for these; the cache just intersects them with what the layer routed
-        # to, which is the accuracy the Poisson model is written in terms of.
-        reference_ids = None
-        if controller is not None and prefetch_top_k < top_k:
-            reference_ids = _rank_unique(logits, top_k)
+            # The full top-`K` picks, for measuring accuracy only. Nothing is
+            # copied for these; the cache just intersects them with what the
+            # layer routed to, which is the accuracy the Poisson model is
+            # written in terms of.
+            reference_ids = None
+            if controller is not None and prefetch_top_k < top_k:
+                reference_ids = _rank_unique(logits, top_k)
 
-        self.cache.prefetch(
-            next_moe,
-            expert_ids,
-            self.stream,
-            num_chunks=self.num_chunks,
-            reference_ids=reference_ids,
-        )
+        # Covers only the handoff to the worker thread, not the copies: those
+        # run on `self.stream` and outlive this scope by design.
+        with record_function_or_nullcontext("expert_prefetch: issue"):
+            self.cache.prefetch(
+                next_moe,
+                expert_ids,
+                self.stream,
+                num_chunks=self.num_chunks,
+                reference_ids=reference_ids,
+            )
 
     def on_forward_end(self) -> None:
         """Feed the controller this pass's measurements, then start cold."""
-        if LOG_ACCURACY:
-            accuracy_tracker.on_forward_end()
+        # Before the summary, not after: `_adapt` is what drains the timing
+        # events, so logging first would always report the previous pass's.
         if self.controller is not None:
             self._adapt()
+        if LOG_ACCURACY:
+            accuracy_tracker.on_forward_end()
         self._num_tokens = 0
         self.cache.reset()
 
@@ -165,14 +184,11 @@ class ExpertPrefetcher:
             for t_comp in stats.t_comp_ms:
                 self.controller.observe_t_comp(num_tokens, t_comp)
         self.controller.observe_t_e(stats.t_e_ms)
-        self._skipped += stats.skipped
-        self._resolved += stats.layers + stats.skipped
+        if LOG_ACCURACY:
+            accuracy_tracker.record_timings(stats.t_comp_ms, stats.t_e_ms)
         if self.controller.on_forward_end():
             self.controller.step()
-            logger.debug(
-                "%s | skipped=%d/%d", self.controller.summary(),
-                self._skipped, self._resolved,
-            )
+            logger.debug("%s", self.controller.summary())
 
 
 def _rank_unique(logits: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -185,15 +201,15 @@ def _rank_unique(logits: torch.Tensor, top_k: int) -> torch.Tensor:
     num_experts = logits.shape[-1]
     top = torch.topk(logits, top_k, dim=-1)
     ids = top.indices.reshape(-1)
-    # scores = top.values.reshape(-1).float()
+    scores = top.values.reshape(-1).float()
 
-    # floor = torch.finfo(torch.float32).min
-    # best = torch.full((num_experts,), floor, device=logits.device)
-    # best.scatter_reduce_(0, ids, scores, reduce="amax", include_self=True)
+    floor = torch.finfo(torch.float32).min
+    best = torch.full((num_experts,), floor, device=logits.device)
+    best.scatter_reduce_(0, ids, scores, reduce="amax", include_self=True)
 
-    # candidates = torch.nonzero(best > floor, as_tuple=True)[0]
-    # return candidates[torch.argsort(best[candidates], descending=True)]
-    return torch.unique(ids)
+    candidates = torch.nonzero(best > floor, as_tuple=True)[0]
+    return candidates[torch.argsort(best[candidates], descending=True)]
+    # return torch.unique(ids)
 
 def _collect_moe_layers(layers: nn.ModuleList) -> dict[int, "RoutedExperts"]:
     """Map decoder layer index -> its routed experts, skipping dense layers and
