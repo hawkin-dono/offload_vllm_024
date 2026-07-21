@@ -322,6 +322,8 @@ class ExpertBuffer:
         # A prefetch is issued from a worker thread, so readiness has two parts:
         # `copies_issued` (the thread finished enqueuing the copies) and
         # `prefetch_event` (the GPU finished executing them).
+        self.maps_ready = threading.Event()
+        self.maps_ready.set()
         self.copies_issued = threading.Event()
         self.copies_issued.set()
         self.prefetch_event: torch.cuda.Event | None = None
@@ -376,24 +378,27 @@ class ExpertBuffer:
         self.slot_to_expert[:] = EMPTY_SLOT
         self.expert_to_slot[:] = EMPTY_SLOT
 
-    def wait_copies_issued(self) -> None:
-        """Block (host-side) until the worker has enqueued the copies.
+    def wait_maps_ready(self) -> None:
+        """Block (host-side) until the slot<->expert maps are published.
 
-        This is what publishes the slot<->expert maps (`stage_ids` runs before
-        `copies_issued` is set), so it is all `resolve` needs before it can remap
-        `topk_ids` on the host. Crucially it does NOT wait for the copies to
-        *execute* on the GPU -- that is `wait_prefetch_event`'s job -- so a
-        blocking D2H issued right after is not serialized behind the staging H2D.
+        The worker fills the maps and sets `maps_ready` up front -- before
+        enqueuing the staging copies -- so this is all `resolve` needs to remap
+        `topk_ids` on the host, and it returns without waiting for the (MiB) H2D
+        to execute. It does NOT imply the copies are enqueued or `prefetch_event`
+        is recorded; the weights are gated separately by `wait_prefetch_event`,
+        which a caller reaches only after `copies_issued`.
         """
-        self.copies_issued.wait()
+        self.maps_ready.wait()
 
     def wait_prefetch_event(self) -> None:
         """Make the current (compute) stream wait for the staged copies to land.
 
         GPU-side only: enqueues a wait on the compute stream and returns without
-        blocking the host. Split from `wait_copies_issued` so the (large) staging
-        H2D is only waited on right before the MoE kernel reads the weights, not
-        before the unrelated `topk_ids` D2H.
+        blocking the host. `prefetch_event` is recorded by the worker only after
+        the copies are enqueued (well after `maps_ready`), so a caller must first
+        ensure the worker has got that far -- via `copies_issued` -- before
+        relying on this; otherwise the event may still be unset and the wait a
+        silent no-op.
         """
         if self.prefetch_event is not None:
             torch.cuda.current_stream().wait_event(self.prefetch_event)
@@ -406,7 +411,7 @@ class ExpertBuffer:
         current stream wait on the copy stream. Cheap when no prefetch is in
         flight, since both events are already set.
         """
-        self.wait_copies_issued()
+        self.copies_issued.wait()
         self.wait_prefetch_event()
 
     def copy_expert(
@@ -864,12 +869,17 @@ class ExpertCache:
         # prefetch failed to hide, and must not be counted as compute.
         begin = self._record_event()
 
-        # Host-side wait only: this publishes the slot<->expert maps. The staged
-        # weights may still be copying on the GPU -- we defer waiting on them
-        # (`wait_prefetch_event`) until just before they are read, so the tiny
-        # `topk_ids` D2H below is not serialized behind the (MiB, ~1ms) staging
-        # H2D. The D2H depends only on the router's topk, not on the prefetch.
-        buf.wait_copies_issued()
+        # The one D2H: bring the routing to the host. Independent of the prefetch
+        # -- it needs only the router's topk -- so it is issued first, before any
+        # wait, and its blocking sync then costs ~microseconds (topkGating) rather
+        # than sitting behind the staging H2D. `topk_ids` is (T, K) ints.
+        topk_np = self._to_host(topk_ids)
+        flat = topk_np.reshape(-1)
+
+        # Host maps: published by the worker as soon as it knows the ids, before
+        # the staging copies land, so the remap is not serialized behind the
+        # (MiB) H2D. This does not wait for the weights themselves.
+        buf.wait_maps_ready()
 
         # If this buffer was not staged for *this* layer, nothing in it can be
         # trusted (see `ExpertBuffer.staged_for`). Dropping the maps turns every
@@ -879,10 +889,6 @@ class ExpertCache:
         if not prefetched:
             buf.clear_ids()
             buf.staged_for = owner.layer_name
-
-        # The one D2H: bring the routing to the host. `topk_ids` is (T, K) ints.
-        topk_np = self._to_host(topk_ids)
-        flat = topk_np.reshape(-1)
 
         # Remap on the host: expert id -> slot, or EMPTY_SLOT for a miss. Fancy
         # indexing returns a fresh array, so patching it below is safe.
@@ -900,9 +906,14 @@ class ExpertCache:
             needed = np.unique(flat)
             self._record_hits(owner, buf, flat, needed, prefetched)
 
-        # Only now make the compute stream wait for the staged weights: the
-        # on-demand fetches below write into the same buffer, and the MoE kernel
-        # that follows reads it, so both must be ordered after the prefetch.
+        # Order the compute stream after this buffer's staged weights before the
+        # on-demand fetches and the MoE kernel read it. `copies_issued` also
+        # guarantees the worker has recorded `prefetch_event` (`maps_ready` fires
+        # earlier, before the copies), so it must precede `wait_prefetch_event`.
+        # This waits only for the *active* buffer's prefetch; the next layer's
+        # prefetch keeps streaming on the side stream, so its chunked copies still
+        # interleave with the on-demand fetches issued just below.
+        buf.copies_issued.wait()
         buf.wait_prefetch_event()
 
         # Fetch whatever missed. Host-side decision; the weight copies go on the
@@ -980,6 +991,8 @@ class ExpertCache:
         victims = evictable[: missing.size].astype(np.int32)
 
         # Update the host maps, then copy the weights in on the compute stream.
+        # `resolve` has already waited on the buffer's prefetch, so the on-demand
+        # copies land into slots the prefetch is done writing.
         buf.slot_to_expert[victims] = missing
         buf.expert_to_slot[missing] = victims
         buf.fetch(owner, missing, victims)
@@ -1002,7 +1015,8 @@ class ExpertCache:
         `expert_ids` must already be deduplicated and ranked best-first: when it
         does not fit the cache the tail is dropped, so the caller's ordering
         decides what survives. Returns as soon as the copies are handed to a
-        worker thread; the consumer synchronizes via `wait_until_ready`.
+        worker thread; the consumer synchronizes via `wait_maps_ready` (host
+        maps) and `wait_prefetch_event` (staged weights).
         """
         buf = self.inactive
 
@@ -1025,6 +1039,7 @@ class ExpertCache:
         expert_ids.record_stream(stream)
 
         buf.issue_event = self._record_event()
+        buf.maps_ready.clear()
         buf.copies_issued.clear()
         device = buf.device
         self._executor.submit(
@@ -1050,20 +1065,33 @@ class ExpertCache:
     ) -> None:
         try:
             torch.cuda.set_device(device)
-            # Published to the consuming `resolve` via `copies_issued` (set in
-            # `finally`). The main thread no longer writes these, so the ranking
-            # that produced them stays off the compute stream.
+            # Written here, off the main thread, so the ranking that produced
+            # these stays off the compute stream. `staged_for` is read by
+            # `resolve` after `maps_ready`, so it must be set before that fires.
             buf.staged_for = owner.layer_name
             with torch.cuda.stream(stream):
                 expert_list = expert_ids.cpu().tolist()
                 n = len(expert_list)
+
                 # Reference ids are host-side telemetry; bring them over here on
                 # the side stream (off the main thread), where they were produced.
+                # Before `maps_ready`, since `resolve`'s hit accounting reads them
+                # right after that wait.
                 buf.reference_ids = (
                     None
                     if reference_ids is None
                     else reference_ids.detach().cpu().numpy()
                 )
+
+                # Record the slot<->expert maps on the host, from the ids we
+                # already have on CPU, so `resolve` reads them without any GPU
+                # round-trip. Staged experts are distinct (no collisions). Publish
+                # `maps_ready` immediately: this is all `resolve` needs to remap,
+                # and it fires before the (MiB) staging copies below execute, so
+                # the consumer is not serialized behind the H2D. The weights
+                # themselves are gated separately, by `prefetch_event`.
+                buf.stage_ids(np.asarray(expert_list, dtype=np.int32))
+                buf.maps_ready.set()
 
                 # Copies go out in chunks with a drain between them, so that
                 # on-demand fetches -- issued on the compute stream by a layer
@@ -1088,11 +1116,6 @@ class ExpertCache:
                             elapsed += start.elapsed_time(end)
                             timed += hi - lo
 
-                # Record the slot<->expert maps on the host, from the ids we
-                # already have on CPU, so `resolve` reads them without any GPU
-                # round-trip. Staged experts are distinct (no collisions).
-                buf.stage_ids(np.asarray(expert_list, dtype=np.int32))
-
                 event = torch.cuda.Event()
                 event.record(stream)
                 buf.prefetch_event = event
@@ -1105,6 +1128,9 @@ class ExpertCache:
             # model rather than a traceback.
             logger.exception("Expert prefetch failed for %s", owner.layer_name)
         finally:
+            # Unblock a consumer even on failure (a stale map degrades to cache
+            # misses, not a hang), and mark the worker fully exited for `reset`.
+            buf.maps_ready.set()
             buf.copies_issued.set()
 
     def _chunk_events(
