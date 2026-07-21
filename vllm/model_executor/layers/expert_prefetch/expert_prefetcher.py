@@ -51,7 +51,10 @@ class ExpertPrefetcher:
         self.moe_layers = moe_layers
         self.config = config
         self.num_chunks = config.prefetch_num_chunks if config else 1
-        # Copies run here so they overlap the compute on the default stream.
+        # The predictor GEMMs, the ranking, and the H2D copies all run here so
+        # they overlap the model's compute and leave the default stream carrying
+        # only the model's own kernels. Default priority (0) is the lowest CUDA
+        # priority, so this never preempts the compute stream.
         self.stream = torch.cuda.Stream()
         # Built on first use: it needs the cache's slot count and a calibrated
         # copy time, and neither exists until the offloader's `post_init` has
@@ -110,11 +113,6 @@ class ExpertPrefetcher:
                 or (controller is not None and controller.due_to_sample())
             )
 
-        # The predictor is two GEMMs and an activation -- microseconds, and
-        # nothing on a profile timeline names them. Without a scope it is
-        # indistinguishable from the model's own kernels on the same stream.
-        with record_function_or_nullcontext("expert_prefetch: predict"):
-            logits = self.predictor.predict(hidden_states, layer_idx)
         top_k = self.predictor.top_k
         prefetch_top_k = controller.topk_for(num_tokens) if controller else top_k
 
@@ -131,20 +129,49 @@ class ExpertPrefetcher:
                 top_k,
                 prefetch_top_k,
             )
-        # Rank by predictor score, not by expert id: what does not fit the cache
-        # is dropped from the tail, and `torch.unique` would sort numerically and
-        # so drop by id -- a systematically biased subset rather than the least
-        # likely experts.
-        with record_function_or_nullcontext("expert_prefetch: rank"):
-            expert_ids = _rank_unique(logits, prefetch_top_k)
 
-            # The full top-`K` picks, for measuring accuracy only. Nothing is
-            # copied for these; the cache just intersects them with what the
-            # layer routed to, which is the accuracy the Poisson model is
-            # written in terms of.
-            reference_ids = None
-            if controller is not None and prefetch_top_k < top_k:
-                reference_ids = _rank_unique(logits, top_k)
+        # The predictor GEMMs, the ranking, and (via `prefetch`) the H2D copies
+        # all run on the side stream, so the compute stream carries only the
+        # model's own kernels and stays densely packed. `hidden_states` is first
+        # snapshotted with a clone *on the compute stream* (in program order,
+        # before this returns): the predictor reads it on the side stream, but
+        # the compute stream is free to overwrite the original in place (e.g. the
+        # residual add) right after, which would otherwise race the predictor.
+        hs = hidden_states.clone()
+        self.stream.wait_stream(torch.cuda.current_stream())
+        hs.record_stream(self.stream)
+        # The full top-`K` picks feed the accuracy telemetry only, and that is
+        # read on sampled passes alone (see `ExpertCache._record_hits`); off a
+        # sampled pass the second ranking is pure waste, so skip it entirely.
+        need_reference = (
+            controller is not None
+            and prefetch_top_k < top_k
+            and (self.cache.sampling or LOG_ACCURACY)
+        )
+        with torch.cuda.stream(self.stream):
+            with record_function_or_nullcontext("expert_prefetch: predict"):
+                logits = self.predictor.predict(hs, layer_idx)
+            # Rank by predictor score, not by expert id: what does not fit the
+            # cache is dropped from the tail. `_rank_unique` is fixed-shape (a
+            # `topk`), so nothing here reads back to the host.
+            with record_function_or_nullcontext("expert_prefetch: rank"):
+                if need_reference:
+                    # One shared `torch.topk`; `reference_ids` is only intersected
+                    # with what the layer routed to, never copied.
+                    expert_ids, reference_ids = _rank_unique_pair(
+                        logits, prefetch_top_k, top_k
+                    )
+                else:
+                    expert_ids = _rank_unique(logits, prefetch_top_k)
+                    reference_ids = None
+
+        # `_rank_unique` returns a host-known number of ids, so the staged/
+        # truncated tallies are recorded here (main thread) rather than from the
+        # worker -- no cross-thread race with `_adapt`/`drain_stats`.
+        ranked = min(prefetch_top_k, self.predictor.num_experts)
+        self.cache.stats.staged += min(ranked, self.cache.num_slots)
+        if ranked > self.cache.num_slots:
+            self.cache.stats.truncated = True
 
         # Covers only the handoff to the worker thread, not the copies: those
         # run on `self.stream` and outlive this scope by design.
@@ -191,25 +218,67 @@ class ExpertPrefetcher:
             logger.debug("%s", self.controller.summary())
 
 
-def _rank_unique(logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """The union of each token's top-`top_k` experts, best-scoring first.
+def _rank_from_top(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Rank experts from a per-token `topk` result, best-first.
 
-    An expert is scored by its best score over the batch, so a prefix of the
-    result is always the most likely experts -- which is what makes truncating
-    it safe when the union outgrows the cache.
+    Each expert is scored by its best score across the batch's tokens, and the
+    result is those scores' top-`top_k`, descending. Split out from
+    `_rank_unique` so the expensive `torch.topk(logits, ...)` -- O(T*num_experts)
+    -- can be shared between two rankings of the same logits (see
+    `_rank_unique_pair`); this tail is only over `num_experts`.
+    """
+    ids = indices.reshape(-1)
+    scores = values.reshape(-1).float()
+
+    floor = torch.finfo(torch.float32).min
+    best = torch.full((num_experts,), floor, device=ids.device)
+    best.scatter_reduce_(0, ids, scores, reduce="amax", include_self=True)
+
+    return torch.topk(best, min(top_k, num_experts)).indices
+
+
+def _rank_unique(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """The `top_k` experts with the best score over the batch, best-first.
+
+    Each expert is scored by its best score across the batch's tokens, and the
+    result is those scores' top-`top_k`, descending -- so a prefix is always the
+    most likely experts, which is what makes truncating it safe when the
+    selection outgrows the cache.
+
+    Fixed-shape and sync-free: the final `torch.topk` returns a known-length
+    result, replacing the `nonzero`/`argsort` that had to read the candidate
+    count back to the host. Identical to the old union at batch size 1, where a
+    single token's top-`top_k` are exactly `top_k` distinct experts.
     """
     num_experts = logits.shape[-1]
     top = torch.topk(logits, top_k, dim=-1)
-    ids = top.indices.reshape(-1)
-    scores = top.values.reshape(-1).float()
+    return _rank_from_top(top.indices, top.values, num_experts, top_k)
 
-    floor = torch.finfo(torch.float32).min
-    best = torch.full((num_experts,), floor, device=logits.device)
-    best.scatter_reduce_(0, ids, scores, reduce="amax", include_self=True)
 
-    candidates = torch.nonzero(best > floor, as_tuple=True)[0]
-    return candidates[torch.argsort(best[candidates], descending=True)]
-    # return torch.unique(ids)
+def _rank_unique_pair(
+    logits: torch.Tensor, small_k: int, big_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank the same logits at two widths from a single `torch.topk`.
+
+    Returns `(small, big)`, equal to `(_rank_unique(logits, small_k),
+    _rank_unique(logits, big_k))` but sharing the one expensive
+    `torch.topk(logits, big_k)`. The top-`small_k` per token is exactly the
+    first `small_k` columns of the top-`big_k` (topk is descending), so `small`
+    is identical to computing it independently. Requires `small_k <= big_k`.
+    """
+    num_experts = logits.shape[-1]
+    top = torch.topk(logits, big_k, dim=-1)
+    big = _rank_from_top(top.indices, top.values, num_experts, big_k)
+    small = _rank_from_top(
+        top.indices[..., :small_k], top.values[..., :small_k], num_experts, small_k
+    )
+    return small, big
+
 
 def _collect_moe_layers(layers: nn.ModuleList) -> dict[int, "RoutedExperts"]:
     """Map decoder layer index -> its routed experts, skipping dense layers and

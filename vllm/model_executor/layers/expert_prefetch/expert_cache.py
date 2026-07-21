@@ -14,11 +14,14 @@ The two swap after every MoE layer, so GPU-resident expert weights cost two
 layers rather than the whole model. A single cache is shared by every MoE layer
 in the model.
 
-Slots are addressed by position, not by expert id: `cached_expert_ids[i]` is the
-global expert id currently staged in slot `i` (or -1 if the slot is empty), and
-the MoE forward remaps `topk_ids` through that table before invoking the kernel.
-Experts predicted incorrectly are simply cache misses: they get fetched on
-demand, which is correct but synchronous.
+Slots are addressed by position, not by expert id: `slot_to_expert[i]` is the
+global expert id currently staged in slot `i` (or -1 if empty), and its inverse
+`expert_to_slot` remaps `topk_ids` into slot indices before the kernel runs. Both
+maps are kept on the HOST (numpy): at decode `topk_ids` is a handful of ids, so
+the remap, miss detection and eviction all run on the CPU -- the only device
+traffic is one D2H of `topk_ids` and one H2D of the result, with no per-layer
+bookkeeping kernels on the compute stream. Experts predicted incorrectly are
+simply cache misses: they get fetched on demand, which is correct but synchronous.
 """
 
 import os
@@ -29,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -45,19 +49,16 @@ EMPTY_SLOT = -1
 class CacheStats:
     """One forward pass of measurements, for `PrefetchController`.
 
-    The device counters are summed on the GPU and read once, at the end of the
-    forward pass -- reading them per layer would put a host sync on the hot path
-    for every MoE layer in the model.
+    All host-side ints: the resolve decision runs on the CPU, so the hit/needed
+    tallies are already on the host and never touch the device.
     """
 
     # Summed over the layers that ran against a prefetched buffer.
-    hits: torch.Tensor
-    needed: torch.Tensor
+    hits: int = 0
+    needed: int = 0
     # Hits the predictor's full top-`K` picks *would* have got. The accuracy the
     # Poisson model wants, uncontaminated by how much we chose to stage.
-    reference_hits: torch.Tensor
-    # Host-side, so free: `torch.unique` has already synced by the time the
-    # prefetcher hands us its ids.
+    reference_hits: int = 0
     staged: int = 0
     layers: int = 0
     truncated: bool = False
@@ -301,8 +302,16 @@ class ExpertBuffer:
         # shadow (e.g. "w13_weight"). Shape (num_slots, *expert_shape).
         self.params: dict[str, torch.Tensor] = {}
 
-        # cached_expert_ids[slot] = global expert id staged there, or EMPTY_SLOT.
-        self.cached_expert_ids: torch.Tensor = torch.empty(0, dtype=torch.int32)
+        # Slot<->expert maps, kept on the HOST as numpy arrays: the whole resolve
+        # decision (remap, miss detection, eviction) runs on the CPU at decode,
+        # so nothing here is a GPU tensor. `slot_to_expert[slot]` = the global
+        # expert id staged in that slot (or EMPTY_SLOT); `expert_to_slot[e]` =
+        # the slot holding expert `e` (or EMPTY_SLOT). The prefetch worker fills
+        # them from the ids it already has on CPU.
+        self.slot_to_expert: np.ndarray = np.empty(0, dtype=np.int32)
+        self.expert_to_slot: np.ndarray = np.empty(0, dtype=np.int32)
+        # The accelerator the weight buffers live on; set in `allocate`.
+        self.device: torch.device | None = None
 
         # Which MoE layer the staged weights belong to. Buffers are recycled
         # across layers, so an id table alone is not enough to trust a slot:
@@ -327,7 +336,7 @@ class ExpertBuffer:
         # *staged* set against what the layer routed to would conflate the
         # predictor being wrong with us having deliberately staged less, and the
         # Poisson model needs the former on its own.
-        self.reference_ids: torch.Tensor | None = None
+        self.reference_ids: np.ndarray | None = None
 
     def allocate(
         self,
@@ -336,6 +345,7 @@ class ExpertBuffer:
         device: torch.device,
     ) -> None:
         self.num_slots = num_slots
+        self.device = device
         for name in self.param_names:
             src = getattr(owner, name)
             self.params[name] = torch.zeros(
@@ -343,9 +353,51 @@ class ExpertBuffer:
                 dtype=src.dtype,
                 device=device,
             )
-        self.cached_expert_ids = torch.full(
-            (num_slots,), EMPTY_SLOT, dtype=torch.int32, device=device
+        self.slot_to_expert = np.full(num_slots, EMPTY_SLOT, dtype=np.int32)
+        self.expert_to_slot = np.full(
+            owner.global_num_experts, EMPTY_SLOT, dtype=np.int32
         )
+
+    def stage_ids(self, expert_ids: np.ndarray) -> None:
+        """Record that slots 0..len-1 now hold `expert_ids` (host-side only).
+
+        Called by the prefetch worker from the ids it already has on CPU, so the
+        maps `resolve` reads are ready without any GPU round-trip.
+        """
+        n = len(expert_ids)
+        self.slot_to_expert[:] = EMPTY_SLOT
+        self.slot_to_expert[:n] = expert_ids
+        self.expert_to_slot[:] = EMPTY_SLOT
+        if n:
+            self.expert_to_slot[expert_ids] = np.arange(n, dtype=np.int32)
+
+    def clear_ids(self) -> None:
+        """Drop the slot<->expert maps: every expert becomes a miss."""
+        self.slot_to_expert[:] = EMPTY_SLOT
+        self.expert_to_slot[:] = EMPTY_SLOT
+
+    def wait_copies_issued(self) -> None:
+        """Block (host-side) until the worker has enqueued the copies.
+
+        This is what publishes the slot<->expert maps (`stage_ids` runs before
+        `copies_issued` is set), so it is all `resolve` needs before it can remap
+        `topk_ids` on the host. Crucially it does NOT wait for the copies to
+        *execute* on the GPU -- that is `wait_prefetch_event`'s job -- so a
+        blocking D2H issued right after is not serialized behind the staging H2D.
+        """
+        self.copies_issued.wait()
+
+    def wait_prefetch_event(self) -> None:
+        """Make the current (compute) stream wait for the staged copies to land.
+
+        GPU-side only: enqueues a wait on the compute stream and returns without
+        blocking the host. Split from `wait_copies_issued` so the (large) staging
+        H2D is only waited on right before the MoE kernel reads the weights, not
+        before the unrelated `topk_ids` D2H.
+        """
+        if self.prefetch_event is not None:
+            torch.cuda.current_stream().wait_event(self.prefetch_event)
+            self.prefetch_event = None
 
     def wait_until_ready(self) -> None:
         """Block until this buffer's staged weights are usable.
@@ -354,10 +406,8 @@ class ExpertBuffer:
         current stream wait on the copy stream. Cheap when no prefetch is in
         flight, since both events are already set.
         """
-        self.copies_issued.wait()
-        if self.prefetch_event is not None:
-            torch.cuda.current_stream().wait_event(self.prefetch_event)
-            self.prefetch_event = None
+        self.wait_copies_issued()
+        self.wait_prefetch_event()
 
     def copy_expert(
         self,
@@ -414,23 +464,28 @@ class ExpertCache:
         )
 
         # Prefetch accuracy: of the experts a layer turned out to need, how many
-        # were already staged. Allocated with the buffers, on the GPU.
-        self._hits: torch.Tensor = torch.zeros((), dtype=torch.long)
-        self._needed: torch.Tensor = torch.zeros((), dtype=torch.long)
+        # were already staged. Host-side ints -- the resolve decision is on CPU.
+        self._hits: int = 0
+        self._needed: int = 0
 
         # Per-forward measurements for the adaptive controller, plus the timing
         # state that feeds them. `stats` is reset by `drain_stats`, and counts
         # only layers that ran against a prefetched buffer -- unlike `_hits` /
         # `_needed`, which are lifetime totals over every layer.
-        self.stats = CacheStats(
-            hits=torch.zeros((), dtype=torch.long),
-            needed=torch.zeros((), dtype=torch.long),
-            reference_hits=torch.zeros((), dtype=torch.long),
-        )
+        self.stats = CacheStats()
         self._sampling = False
         self._prev_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         # Per-expert copy times measured by the worker thread, in milliseconds.
         self._copy_times: deque[float] = deque(maxlen=64)
+
+        # Reusable staging buffers for the per-layer `resolve` transfers, so no
+        # tensor is allocated on the hot path. `_host_topk` receives the D2H of
+        # `topk_ids`; `_host_out`/`_dev_out` carry the remapped ids H2D. Grown
+        # (never shrunk) when a larger batch or a new dtype appears. Only ever
+        # touched from the compute thread in `resolve`, so no locking is needed.
+        self._host_topk: torch.Tensor | None = None
+        self._host_out: torch.Tensor | None = None
+        self._dev_out: torch.Tensor | None = None
 
     @property
     def owner(self) -> "RoutedExperts":
@@ -512,13 +567,9 @@ class ExpertCache:
         device = torch.device(torch.cuda.current_device())
         self.ping.allocate(owner, num_slots, device)
         self.pong.allocate(owner, num_slots, device)
-        self._hits = torch.zeros((), dtype=torch.long, device=device)
-        self._needed = torch.zeros((), dtype=torch.long, device=device)
-        self.stats = CacheStats(
-            hits=torch.zeros((), dtype=torch.long, device=device),
-            needed=torch.zeros((), dtype=torch.long, device=device),
-            reference_hits=torch.zeros((), dtype=torch.long, device=device),
-        )
+        self._hits = 0
+        self._needed = 0
+        self.stats = CacheStats()
         self.allocated = True
 
         bytes_per_buffer = sum(
@@ -566,8 +617,8 @@ class ExpertCache:
         torch.cuda.synchronize()
 
         # Leave no trace: these slots hold weights nothing staged, and the id
-        # table must not claim otherwise.
-        buf.cached_expert_ids.fill_(EMPTY_SLOT)
+        # maps must not claim otherwise.
+        buf.clear_ids()
         buf.staged_for = None
 
         t_e = start.elapsed_time(end) / num_samples
@@ -594,8 +645,8 @@ class ExpertCache:
     def drain_stats(self) -> "ForwardStats":
         """Read this forward's measurements, and reset them.
 
-        Costs one device sync for the three counters, paid once per forward pass
-        rather than once per layer.
+        All counters are host ints (the resolve decision is on CPU), so this is
+        free -- no device sync.
         """
         stats = self.stats
         # Partitioned in one pass: `ready()` is a live device query, so asking
@@ -622,9 +673,9 @@ class ExpertCache:
             ),
         )
         self._copy_times.clear()
-        stats.hits.zero_()
-        stats.needed.zero_()
-        stats.reference_hits.zero_()
+        stats.hits = 0
+        stats.needed = 0
+        stats.reference_hits = 0
         stats.staged = 0
         stats.layers = 0
         stats.truncated = False
@@ -635,15 +686,22 @@ class ExpertCache:
         """Fraction of needed experts that prediction had already staged.
 
         1.0 means every expert a layer routed to was prefetched; 0.0 means all
-        were fetched on demand (which is what you get with no predictor). Forces
-        a device sync, so read it between forward passes, not inside one.
+        were fetched on demand (which is what you get with no predictor).
         """
-        needed = int(self._needed)
-        return float(self._hits) / needed if needed else 0.0
+        return self._hits / self._needed if self._needed else 0.0
 
     def reset_stats(self) -> None:
-        self._hits.zero_()
-        self._needed.zero_()
+        self._hits = 0
+        self._needed = 0
+
+    @property
+    def sampling(self) -> bool:
+        """Whether this forward pass is recording timing/accuracy telemetry.
+
+        Set by `begin_forward` at the first prefetch of the pass, so it is
+        stable by the time a layer ranks or resolves against the cache.
+        """
+        return self._sampling
 
     @property
     def active(self) -> ExpertBuffer:
@@ -668,7 +726,7 @@ class ExpertCache:
             buf.reference_ids = None
             buf.issue_event = None
             if buf.num_slots:
-                buf.cached_expert_ids.fill_(EMPTY_SLOT)
+                buf.clear_ids()
         self.active_name = "ping"
         self._prev_events = None
 
@@ -703,19 +761,85 @@ class ExpertCache:
     def _record_layer_stats(
         self,
         buf: ExpertBuffer,
-        needed: torch.Tensor,
-        hit_count: torch.Tensor,
+        needed: np.ndarray,
+        hit_count: int,
+        needed_count: int,
     ) -> None:
-        """Tally one prefetched layer for the controller, without syncing."""
+        """Tally one prefetched layer for the controller (host-side ints).
+
+        `needed` is the distinct experts this layer routed to. Everything here
+        is a plain int -- the totals are drained once per forward.
+        """
         stats = self.stats
         stats.hits += hit_count
-        stats.needed += needed.numel()
+        stats.needed += needed_count
         stats.layers += 1
         if buf.reference_ids is not None:
-            reference = buf.reference_ids.to(needed.device, needed.dtype)
-            stats.reference_hits += torch.isin(needed, reference).sum()
+            stats.reference_hits += int(np.isin(needed, buf.reference_ids).sum())
         else:
             stats.reference_hits += hit_count
+
+    def _to_host(self, topk_ids: torch.Tensor) -> np.ndarray:
+        """D2H `topk_ids` into a reusable pinned buffer; return a numpy view.
+
+        Replaces `topk_ids.cpu().numpy()`: the pinned buffer turns the transfer
+        into a DMA and avoids a pageable allocation on every layer. The read is
+        host-side, so the copy is synced with an event first. The returned view
+        aliases the buffer and is only read downstream (the remap indexes it),
+        so reuse is safe until the next `resolve`.
+        """
+        n = topk_ids.numel()
+        host = self._host_topk
+        if host is None or host.numel() < n or host.dtype != topk_ids.dtype:
+            host = torch.empty(n, dtype=topk_ids.dtype, pin_memory=True)
+            self._host_topk = host
+        dst = host[:n]
+        dst.copy_(topk_ids.reshape(-1), non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        event.synchronize()
+        return dst.numpy().reshape(tuple(topk_ids.shape))
+
+    def _to_device(
+        self,
+        cached: np.ndarray,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """H2D the remapped ids through reusable pinned/device buffers.
+
+        Replaces `torch.as_tensor(...).to(device)`. The copy is non-blocking:
+        the MoE kernel that reads the result is issued right after, on the same
+        (compute) stream, so it is ordered after the transfer without a sync.
+
+        Both buffers are reused across layers, which is safe in eager mode (the
+        feature requires `--enforce-eager`):
+          * `_dev_out` -- layer L's kernel reads it before layer L+1's H2D, which
+            is ordered after that kernel on the shared compute stream;
+          * `_host_out` -- every `resolve` calls `_to_host` (a full-stream sync)
+            before this, so the previous layer's H2D has drained and the host
+            write here cannot race a DMA still reading the pinned buffer.
+        """
+        n = cached.size
+        host = self._host_out
+        if host is None or host.numel() < n or host.dtype != dtype:
+            host = torch.empty(n, dtype=dtype, pin_memory=True)
+            self._host_out = host
+        dev = self._dev_out
+        if (
+            dev is None
+            or dev.numel() < n
+            or dev.dtype != dtype
+            or dev.device != device
+        ):
+            dev = torch.empty(n, dtype=dtype, device=device)
+            self._dev_out = dev
+        host_v = host[:n]
+        host_v.numpy()[:] = cached.reshape(-1)
+        dev_v = dev[:n]
+        dev_v.copy_(host_v, non_blocking=True)
+        return dev_v.view(shape)
 
     def resolve(
         self,
@@ -727,80 +851,142 @@ class ExpertCache:
         Waits for any in-flight prefetch, fetches whatever the predictor missed,
         and rewrites `topk_ids` from global expert ids into cache slot indices.
         Returns the buffer to run against, and the remapped ids.
+
+        The remap, miss detection and eviction all run on the CPU: at decode
+        `topk_ids` is a handful of ids, and deciding which pinned rows to fetch
+        is a host decision anyway. The only device traffic is one D2H of
+        `topk_ids`, the (rare) on-demand weight copies, and one H2D of the
+        remapped ids -- no per-layer bookkeeping kernels on the compute stream.
         """
         buf = self.active
 
         # Recorded before the wait, deliberately: a stall here is time the
-        # prefetch failed to hide, and must not be counted as compute. Absorbing
-        # it would make a larger prefetch look like more compute to hide behind,
-        # which would grow the prefetch again -- a runaway.
+        # prefetch failed to hide, and must not be counted as compute.
         begin = self._record_event()
 
-        buf.wait_until_ready()
+        # Host-side wait only: this publishes the slot<->expert maps. The staged
+        # weights may still be copying on the GPU -- we defer waiting on them
+        # (`wait_prefetch_event`) until just before they are read, so the tiny
+        # `topk_ids` D2H below is not serialized behind the (MiB, ~1ms) staging
+        # H2D. The D2H depends only on the router's topk, not on the prefetch.
+        buf.wait_copies_issued()
 
         # If this buffer was not staged for *this* layer, nothing in it can be
-        # trusted (see `ExpertBuffer.staged_for`). Dropping the id table turns
-        # every expert into a miss, which is slow but always correct -- this is
-        # also the path taken when prediction is disabled entirely.
+        # trusted (see `ExpertBuffer.staged_for`). Dropping the maps turns every
+        # expert into a miss -- slow but always correct, and the path taken when
+        # prediction is disabled entirely.
         prefetched = buf.staged_for == owner.layer_name
         if not prefetched:
-            buf.cached_expert_ids.fill_(EMPTY_SLOT)
+            buf.clear_ids()
             buf.staged_for = owner.layer_name
 
-        slot_ids = buf.cached_expert_ids
-        needed = torch.unique(topk_ids.reshape(-1)).to(slot_ids.device, torch.int32)
+        # The one D2H: bring the routing to the host. `topk_ids` is (T, K) ints.
+        topk_np = self._to_host(topk_ids)
+        flat = topk_np.reshape(-1)
 
-        hit = torch.isin(needed, slot_ids)
-        hit_count = hit.sum()
-        # Accumulate on-device: reading these would force a sync, so the tally is
-        # kept on the GPU and only materialized by `hit_rate`.
-        self._hits += hit_count
-        self._needed += needed.numel()
-        if prefetched:
-            self._record_layer_stats(buf, needed, hit_count)
-        if LOG_ACCURACY:
-            # int(hit_count) forces a device sync; only paid when tracking is on.
-            accuracy_tracker.update(
-                owner.layer_name, int(hit_count), needed.numel()
-            )
+        # Remap on the host: expert id -> slot, or EMPTY_SLOT for a miss. Fancy
+        # indexing returns a fresh array, so patching it below is safe.
+        cached = buf.expert_to_slot[flat]
+        miss = cached < 0
 
-        if not bool(hit.all()):
-            missing = needed[~hit]
-            # A slot is evictable unless it holds an expert this layer needs.
-            # Empty slots (EMPTY_SLOT) are never "needed", so they go first only
-            # by virtue of ordering -- correctness does not depend on that.
-            evictable = torch.nonzero(~torch.isin(slot_ids, needed), as_tuple=True)[0]
-            if evictable.numel() < missing.numel():
-                raise RuntimeError(
-                    f"Expert cache too small: layer {owner.layer_name} routes to "
-                    f"{needed.numel()} experts but the cache has "
-                    f"{buf.num_slots} slots. Raise --num-cache-slots."
-                )
-            victims = evictable[: missing.numel()]
-            slot_ids[victims] = missing
-            # Issued on the current stream, so the MoE kernel that follows is
-            # ordered after these copies without an explicit sync.
-            buf.fetch(owner, missing.cpu(), victims.cpu())
+        # `needed` (the distinct routed experts) is wanted by both the telemetry
+        # and the miss handler, but neither runs on the common all-hit non-sampled
+        # path, so compute it at most once and only when something needs it.
+        needed: np.ndarray | None = None
 
-        # Everything between `begin` and here is dead time: the stall above plus
-        # the on-demand copies, which are the only H2D on the compute stream
-        # (the prefetch runs on its own). The next layer subtracts it.
+        # Accuracy telemetry for the controller -- consumed once per forward and
+        # only on sampled passes. Computed pre-fetch so a hit means prediction.
+        if self._sampling or LOG_ACCURACY:
+            needed = np.unique(flat)
+            self._record_hits(owner, buf, flat, needed, prefetched)
+
+        # Only now make the compute stream wait for the staged weights: the
+        # on-demand fetches below write into the same buffer, and the MoE kernel
+        # that follows reads it, so both must be ordered after the prefetch.
+        buf.wait_prefetch_event()
+
+        # Fetch whatever missed. Host-side decision; the weight copies go on the
+        # compute stream so the MoE kernel is ordered after them.
+        if miss.any():
+            if needed is None:
+                needed = np.unique(flat)
+            cached = self._resolve_misses(owner, buf, flat, cached, miss, needed)
+
+        # Everything between `begin` and here is dead time: the D2H stall plus
+        # the on-demand copies. The next layer subtracts it.
         self._close_window(buf, begin)
 
-        # topk_ids are global expert ids; the kernel indexes the cache buffer, so
-        # they have to become slot indices.
-        lookup = torch.full(
-            (owner.global_num_experts,),
-            EMPTY_SLOT,
-            device=topk_ids.device,
-            dtype=topk_ids.dtype,
+        # Ship the remapped ids back for the kernel (T*K ints); the MoE kernel
+        # that follows is ordered after this H2D on the compute stream.
+        cached_topk_ids = self._to_device(
+            cached, tuple(topk_ids.shape), topk_ids.dtype, topk_ids.device
         )
-        occupied = slot_ids >= 0
-        positions = torch.arange(buf.num_slots, device=slot_ids.device)
-        lookup[slot_ids[occupied].long()] = positions[occupied].to(topk_ids.dtype)
-
-        cached_topk_ids = lookup[topk_ids]
         return buf, cached_topk_ids
+
+    def _record_hits(
+        self,
+        owner: "RoutedExperts",
+        buf: ExpertBuffer,
+        flat: np.ndarray,
+        needed: np.ndarray,
+        prefetched: bool,
+    ) -> None:
+        """Hit/needed accounting on the host, on sampled passes only.
+
+        `flat` is the routed expert ids and `needed` their distinct values
+        (deduped once by the caller). A routed expert is a hit iff its pre-fetch
+        slot is valid, so this must run before `_resolve_misses`.
+        """
+        needed_count = int(needed.size)
+        hit_count = int((buf.expert_to_slot[needed] >= 0).sum())
+
+        self._hits += hit_count
+        self._needed += needed_count
+        if prefetched:
+            self._record_layer_stats(buf, needed, hit_count, needed_count)
+        if LOG_ACCURACY:
+            accuracy_tracker.update(owner.layer_name, hit_count, needed_count)
+
+    def _resolve_misses(
+        self,
+        owner: "RoutedExperts",
+        buf: ExpertBuffer,
+        flat: np.ndarray,
+        cached: np.ndarray,
+        miss: np.ndarray,
+        needed: np.ndarray,
+    ) -> np.ndarray:
+        """Fetch routed experts that were not staged; return the patched slots.
+
+        Runs entirely on the host -- the `topk_ids` D2H already paid the only
+        sync. Mutates the buffer's slot maps and issues the on-demand weight
+        copies on the compute stream, so the MoE kernel is ordered after them.
+        `needed` is the distinct routed experts, deduped once by the caller.
+        """
+        # Distinct missing experts.
+        missing = np.unique(flat[miss])
+
+        # A slot is evictable unless it holds an expert this layer still needs.
+        # Empty slots (EMPTY_SLOT) never match `needed`, so they are evictable.
+        occupied = buf.slot_to_expert >= 0
+        holds_needed = occupied & np.isin(buf.slot_to_expert, needed)
+        evictable = np.nonzero(~holds_needed)[0]
+        if evictable.size < missing.size:
+            raise RuntimeError(
+                f"Expert cache too small: layer {owner.layer_name} routes to "
+                f"{int(needed.size)} experts but the cache has "
+                f"{buf.num_slots} slots. Raise --num-cache-slots."
+            )
+        victims = evictable[: missing.size].astype(np.int32)
+
+        # Update the host maps, then copy the weights in on the compute stream.
+        buf.slot_to_expert[victims] = missing
+        buf.expert_to_slot[missing] = victims
+        buf.fetch(owner, missing, victims)
+
+        # Patch the caller's remap for the just-fetched experts.
+        cached[miss] = buf.expert_to_slot[flat[miss]]
+        return cached
 
     def prefetch(
         self,
@@ -819,39 +1005,37 @@ class ExpertCache:
         worker thread; the consumer synchronizes via `wait_until_ready`.
         """
         buf = self.inactive
-        # The buffer we are about to overwrite must not still be in flight.
-        # This is the only ordering this needs: the executor has a single worker,
-        # so a prefetch issued while the previous one is still running queues
-        # behind it rather than racing it. Dropping it instead would leave the
-        # inactive buffer staged for an older layer, and `resolve` would then
-        # invalidate it wholesale -- the layer falls back to fetch-on-demand and
-        # scores a flat zero hit rate.
-        buf.wait_until_ready()
 
         if expert_ids.numel() > buf.num_slots:
             expert_ids = expert_ids[: buf.num_slots]
-            self.stats.truncated = True
-        self.stats.staged += expert_ids.numel()
 
-        # The copy stream must not run ahead of the compute stream. It reads
-        # `expert_ids`, which the predictor just produced there, and it
-        # overwrites a buffer the *previous* layer's MoE kernel may still be
-        # reading. Both are silent data races without this: the copies land
-        # while the reads are in flight, and the corruption surfaces as subtly
-        # wrong logits, not a crash.
+        # The copy stream must not run ahead of the compute stream. It overwrites
+        # a buffer the *previous* layer's MoE kernel may still be reading, and
+        # `expert_ids` was produced on this same side stream by the ranker. This
+        # orders the copies after the compute stream's current tail; the
+        # single-worker executor serializes successive prefetches of this buffer
+        # (each buffer is re-staged only every other layer, after being consumed),
+        # so no explicit wait for the previous copy is needed here -- and doing
+        # one would stall the compute stream, which is exactly what we are
+        # removing.
         stream.wait_stream(torch.cuda.current_stream())
 
         # Keep `expert_ids` alive until the copy stream is done with it, since
         # the allocator only tracks the stream it was created on.
         expert_ids.record_stream(stream)
 
-        buf.staged_for = owner.layer_name
-        buf.reference_ids = reference_ids
         buf.issue_event = self._record_event()
         buf.copies_issued.clear()
-        device = buf.cached_expert_ids.device
+        device = buf.device
         self._executor.submit(
-            self._prefetch_worker, owner, buf, expert_ids, stream, device, num_chunks
+            self._prefetch_worker,
+            owner,
+            buf,
+            expert_ids,
+            stream,
+            device,
+            num_chunks,
+            reference_ids,
         )
 
     def _prefetch_worker(
@@ -862,12 +1046,24 @@ class ExpertCache:
         stream: torch.cuda.Stream,
         device: torch.device,
         num_chunks: int,
+        reference_ids: torch.Tensor | None,
     ) -> None:
         try:
             torch.cuda.set_device(device)
+            # Published to the consuming `resolve` via `copies_issued` (set in
+            # `finally`). The main thread no longer writes these, so the ranking
+            # that produced them stays off the compute stream.
+            buf.staged_for = owner.layer_name
             with torch.cuda.stream(stream):
                 expert_list = expert_ids.cpu().tolist()
                 n = len(expert_list)
+                # Reference ids are host-side telemetry; bring them over here on
+                # the side stream (off the main thread), where they were produced.
+                buf.reference_ids = (
+                    None
+                    if reference_ids is None
+                    else reference_ids.detach().cpu().numpy()
+                )
 
                 # Copies go out in chunks with a drain between them, so that
                 # on-demand fetches -- issued on the compute stream by a layer
@@ -892,9 +1088,10 @@ class ExpertCache:
                             elapsed += start.elapsed_time(end)
                             timed += hi - lo
 
-                ids = buf.cached_expert_ids
-                ids.fill_(EMPTY_SLOT)
-                ids[:n] = expert_ids.to(device, dtype=torch.int32)
+                # Record the slot<->expert maps on the host, from the ids we
+                # already have on CPU, so `resolve` reads them without any GPU
+                # round-trip. Staged experts are distinct (no collisions).
+                buf.stage_ids(np.asarray(expert_list, dtype=np.int32))
 
                 event = torch.cuda.Event()
                 event.record(stream)
