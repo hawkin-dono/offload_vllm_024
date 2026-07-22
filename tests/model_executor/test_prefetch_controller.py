@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from vllm.config.offload import ExpertCacheOffloadConfig
-from vllm.model_executor.layers.expert_prefetch.expert_cache import _chunk_bounds
+from vllm.model_executor.layers.expert_prefetch.expert_cache import (
+    NATIVE_BITS,
+    _chunk_bounds,
+)
 from vllm.model_executor.layers.expert_prefetch.expert_prefetcher import _rank_unique
 from vllm.model_executor.layers.expert_prefetch.prefetch_controller import (
     PrefetchController,
@@ -25,7 +28,9 @@ def _controller(**overrides) -> PrefetchController:
         num_experts=NUM_EXPERTS,
         num_slots=NUM_EXPERTS,
         cfg=cfg,
-        t_e_ms=0.1,
+        # Copy times are now keyed by precision; with no resident quantized
+        # widths there is only the native (bf16) candidate.
+        t_e_ms={NATIVE_BITS: 0.1},
     )
 
 
@@ -91,13 +96,13 @@ def test_bubble_term_converts_union_budget_to_per_token():
     # 2 ms of compute at 0.1 ms per expert = 20 experts fit under it.
     # At p=4 the batch staged 40 experts, so the union ratio is 10 experts per
     # unit of p, and the budget is worth p=2.
-    assert controller._bubble_target(2.0, p_cur=4.0, staged_avg=40.0) == pytest.approx(
-        2.0
-    )
+    assert controller._bubble_target(
+        2.0, p_cur=4.0, staged_avg=40.0, t_e_ms=0.1
+    ) == pytest.approx(2.0)
     # Batch of 1: union size equals p, so the budget passes through unscaled.
-    assert controller._bubble_target(2.0, p_cur=4.0, staged_avg=4.0) == pytest.approx(
-        20.0
-    )
+    assert controller._bubble_target(
+        2.0, p_cur=4.0, staged_avg=4.0, t_e_ms=0.1
+    ) == pytest.approx(20.0)
 
 
 def test_bubble_target_capped_by_cache_size():
@@ -107,10 +112,12 @@ def test_bubble_target_capped_by_cache_size():
         num_experts=NUM_EXPERTS,
         num_slots=16,
         cfg=ExpertCacheOffloadConfig(),
-        t_e_ms=0.1,
+        t_e_ms={NATIVE_BITS: 0.1},
     )
     # 100 ms would buy 1000 experts, but only 16 slots exist.
-    assert controller._bubble_target(100.0, p_cur=1.0, staged_avg=1.0) == 16.0
+    assert (
+        controller._bubble_target(100.0, p_cur=1.0, staged_avg=1.0, t_e_ms=0.1) == 16.0
+    )
 
 
 def test_buckets_separate_decode_from_prefill():
@@ -194,11 +201,11 @@ def test_t_e_is_clamped_around_calibration():
     """A contended interval must not be able to erase the bubble budget."""
     controller = _controller()
     for _ in range(100):
-        controller.observe_t_e(1000.0)
-    assert controller._t_e_ms <= 0.1 * 4.0
+        controller.observe_t_e({NATIVE_BITS: 1000.0})
+    assert controller._t_e_ms[NATIVE_BITS] <= 0.1 * 4.0
     for _ in range(100):
-        controller.observe_t_e(1e-9)
-    assert controller._t_e_ms >= 0.1 * 0.5
+        controller.observe_t_e({NATIVE_BITS: 1e-9})
+    assert controller._t_e_ms[NATIVE_BITS] >= 0.1 * 0.5
 
 
 def test_sampling_and_step_land_on_different_passes():

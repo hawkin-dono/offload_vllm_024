@@ -16,6 +16,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.expert_prefetch.expert_cache import (
     LOG_ACCURACY,
+    NATIVE_BITS,
     ExpertCache,
     accuracy_tracker,
     maybe_create_expert_cache,
@@ -113,8 +114,14 @@ class ExpertPrefetcher:
                 or (controller is not None and controller.due_to_sample())
             )
 
-        top_k = self.predictor.top_k
-        prefetch_top_k = controller.topk_for(num_tokens) if controller else top_k
+        top_k = self.predictor.top_k 
+        if controller is not None:
+            # Precision is chosen alongside the count, per batch-size bucket:
+            # the highest-fidelity width whose copies still fit under one layer's
+            # compute (bf16 when the budget is large). See `_select_precision`.
+            prefetch_top_k, prefetch_bits = controller.select(num_tokens)
+        else:
+            prefetch_top_k, prefetch_bits = top_k, NATIVE_BITS
 
         if LOG_ACCURACY:
             # Attributed to the layer being staged, so the summary can print it
@@ -182,6 +189,7 @@ class ExpertPrefetcher:
                 self.stream,
                 num_chunks=self.num_chunks,
                 reference_ids=reference_ids,
+                num_bits=prefetch_bits,
             )
 
     def on_forward_end(self) -> None:
@@ -215,7 +223,13 @@ class ExpertPrefetcher:
             accuracy_tracker.record_timings(stats.t_comp_ms, stats.t_e_ms)
         if self.controller.on_forward_end():
             self.controller.step()
-            logger.debug("%s", self.controller.summary())
+            # At INFO alongside the [ExpertAcc] line when accuracy logging is on,
+            # so the per-precision t_e/budget (including the widths the selector
+            # did not pick) is visible; DEBUG otherwise.
+            if LOG_ACCURACY:
+                logger.info("%s", self.controller.summary())
+            else:
+                logger.debug("%s", self.controller.summary())
 
 
 def _rank_from_top(

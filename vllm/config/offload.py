@@ -11,6 +11,16 @@ from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "expert_cache"]
 
+# Resident CPU-side quantized precisions must be a subset of these. Mirrors
+# `expert_quant.SUPPORTED_EXPERT_QUANT_BITS`, duplicated here to keep this
+# config module free of the triton import `expert_quant` pulls in.
+SUPPORTED_EXPERT_QUANT_BITS = (8, 4, 2)
+
+# Sentinel bit width standing for the native (bf16) originals, which are always
+# a prefetch candidate and cost no extra host memory. Mirrors
+# `expert_cache.NATIVE_BITS`.
+NATIVE_BITS = 16
+
 
 @config
 class UVAOffloadConfig:
@@ -108,6 +118,50 @@ class ExpertCacheOffloadConfig:
     Lowering this trades GPU memory for a higher chance of a cache miss (which
     costs a synchronous fetch-on-demand), and must be at least as large as the
     number of distinct experts a single forward pass routes to.
+    """
+
+    expert_quant_bits: list[int] = Field(default_factory=list)
+    """Resident CPU-side quantized precisions of routed expert weights, a
+    subset of {8, 4, 2}. Empty (the default) keeps weights in their original
+    dtype and disables quantization.
+
+    Each listed width stores a second, symmetric round-to-nearest copy of every
+    expert in pinned host memory alongside the bf16 originals; per batch-size
+    bucket the `PrefetchController` picks which of these -- or bf16 -- to stage
+    over PCIe, unpacking it on the GPU into the same cache slots the MoE kernel
+    reads. H2D traffic for a quantized width drops roughly 2x/4x/8x at
+    int8/int4/int2. In exchange pinned host memory grows by the summed fraction
+    of the expert weights (1/2 + 1/4 + 1/8 for all three), and accuracy takes
+    the hit of uncalibrated RTN -- far more at int2, where a group has four
+    levels. Evaluate before enabling; this is a model-quality change.
+
+    bf16 is always an implicit candidate and costs no extra host memory (the
+    offloaded originals). Fetch-on-demand always uses the coarsest resident
+    width (int2 when present) to keep the critical-path stall smallest. The GPU
+    cost is fixed and small: packed weights land in shared dequant rings of a
+    few experts, so the GPU cache stays the bf16 ping/pong plus ~150 MiB.
+    """
+
+    expert_quant_group_size: int = Field(default=128)
+    """Quantization group size along the reduction (last) dim of each expert
+    weight, or -1 for one scale per output row. Only used when
+    `expert_quant_bits` is non-empty.
+
+    The reduction dim -- `hidden_size` for w13_weight,
+    `intermediate_size_per_partition` for w2_weight -- must be divisible by
+    this. Note the latter is sharded by tensor parallelism, so a group size
+    that works at tp=1 can fail at tp=4; use -1 in that case. It must also be a
+    multiple of the smallest resident width's values-per-byte (4 at int2).
+    """
+
+    prefetch_pin_bits: int = Field(default=NATIVE_BITS)
+    """Precision to stage when `prefetch_topk` pins the staged count.
+
+    Only consulted when `prefetch_topk` is nonzero (adaptation is off, so the
+    controller cannot pick a precision). Default 16 stages bf16, reproducing
+    the unquantized behaviour; set to a resident width (8, 4 or 2) to benchmark
+    a fixed quantized prefetch. Fetch-on-demand is independent of this and still
+    uses the coarsest resident width.
     """
 
     expert_predictor_dir: str = ""
@@ -239,6 +293,38 @@ class OffloadConfig:
                 "Set offload_backend explicitly to suppress this warning.",
                 stacklevel=2,
             )
+
+        quant_bits = self.expert_cache.expert_quant_bits
+        if quant_bits:
+            supported = set(SUPPORTED_EXPERT_QUANT_BITS)
+            bad = sorted(b for b in set(quant_bits) if b not in supported)
+            if bad:
+                raise ValueError(
+                    f"expert_quant_bits {bad} not supported; each must be one "
+                    f"of {sorted(supported, reverse=True)}."
+                )
+            # Normalise to a deduped, fidelity-descending list so every
+            # consumer sees the same order (bf16 first, then 8, 4, 2).
+            quant_bits = sorted(set(quant_bits), reverse=True)
+            self.expert_cache.expert_quant_bits = quant_bits
+
+            group_size = self.expert_cache.expert_quant_group_size
+            # The strictest packing constraint is the smallest resident width:
+            # a byte holds 8 // bits values (4 at int2), and a group must not
+            # straddle a byte boundary.
+            per_byte = 8 // min(quant_bits)
+            if group_size != -1 and (group_size < per_byte or group_size % per_byte):
+                raise ValueError(
+                    f"expert_quant_group_size ({group_size}) must be -1 (one "
+                    f"scale per row) or a multiple of {per_byte} for the "
+                    f"smallest expert_quant_bits ({min(quant_bits)})."
+                )
+            if self.offload_backend != "expert_cache":
+                warnings.warn(
+                    "expert_quant_bits is set but offload_backend is "
+                    f"'{self.offload_backend}'. It will be ignored.",
+                    stacklevel=2,
+                )
         return self
 
     def compute_hash(self) -> str:
@@ -254,6 +340,8 @@ class OffloadConfig:
         The expert-cache prefetch policy knobs are the exception: they only
         change how many expert weights get staged and when, never the traced
         graph, so including them would invalidate the cache for nothing.
+        `expert_quant_bits` and `expert_quant_group_size` are structural (they
+        decide which pinned stores get built), so they stay in the hash.
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
@@ -269,6 +357,7 @@ class OffloadConfig:
                 "prefetch_num_chunks",
                 "prefetch_ema_alpha",
                 "prefetch_min_topk",
+                "prefetch_pin_bits",
             },
         )
         hash_str = hash_factors(factors)

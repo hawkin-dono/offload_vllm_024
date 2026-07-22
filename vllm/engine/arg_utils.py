@@ -525,6 +525,11 @@ class EngineArgs:
         ExpertCacheOffloadConfig, "expert_cache_params"
     )
     num_cache_slots: int = ExpertCacheOffloadConfig.num_cache_slots
+    expert_quant_bits: list[int] = get_field(
+        ExpertCacheOffloadConfig, "expert_quant_bits"
+    )
+    expert_quant_group_size: int = ExpertCacheOffloadConfig.expert_quant_group_size
+    prefetch_pin_bits: int = ExpertCacheOffloadConfig.prefetch_pin_bits
     expert_predictor_dir: str = ExpertCacheOffloadConfig.expert_predictor_dir
     prefetch_topk: int = ExpertCacheOffloadConfig.prefetch_topk
     prefetch_confidence: float = ExpertCacheOffloadConfig.prefetch_confidence
@@ -1240,6 +1245,16 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--num-cache-slots", **expert_cache_kwargs["num_cache_slots"]
+        )
+        offload_group.add_argument(
+            "--expert-quant-bits", **expert_cache_kwargs["expert_quant_bits"]
+        )
+        offload_group.add_argument(
+            "--expert-quant-group-size",
+            **expert_cache_kwargs["expert_quant_group_size"],
+        )
+        offload_group.add_argument(
+            "--prefetch-pin-bits", **expert_cache_kwargs["prefetch_pin_bits"]
         )
         offload_group.add_argument(
             "--expert-predictor-dir", **expert_cache_kwargs["expert_predictor_dir"]
@@ -2352,6 +2367,9 @@ class EngineArgs:
             expert_cache=ExpertCacheOffloadConfig(
                 expert_cache_params=self.expert_cache_params,
                 num_cache_slots=self.num_cache_slots,
+                expert_quant_bits=self.expert_quant_bits,
+                expert_quant_group_size=self.expert_quant_group_size,
+                prefetch_pin_bits=self.prefetch_pin_bits,
                 expert_predictor_dir=self.expert_predictor_dir,
                 prefetch_topk=self.prefetch_topk,
                 prefetch_confidence=self.prefetch_confidence,

@@ -55,6 +55,10 @@ _TE_ALPHA = 0.05
 _TE_MIN_FACTOR = 0.5
 _TE_MAX_FACTOR = 4.0
 
+# Bit width standing for the native (bf16) originals -- always a candidate and
+# the highest fidelity. Mirrors `expert_cache.NATIVE_BITS`.
+NATIVE_BITS = 16
+
 
 @dataclass
 class _Accum:
@@ -83,12 +87,16 @@ class BucketState:
     `p` is kept as a float even though only `floor(p)` is ever used: the
     corrections are often smaller than one expert, and rounding at every step
     would discard them instead of letting them accumulate.
+
+    `precision` is the bit width the last `step` chose to stage this bucket at
+    (NATIVE_BITS for bf16), read back by `select`.
     """
 
     p: float
     ema_acc: float = 0.0
     ema_t_comp_ms: float = 0.0
     samples: int = 0
+    precision: int = NATIVE_BITS
 
 
 class PrefetchController:
@@ -105,7 +113,7 @@ class PrefetchController:
         num_experts: int,
         num_slots: int,
         cfg: "ExpertCacheOffloadConfig",
-        t_e_ms: float,
+        t_e_ms: dict[int, float],
     ):
         self.top_k = top_k
         self.num_experts = num_experts
@@ -123,20 +131,33 @@ class PrefetchController:
         self.interval = cfg.prefetch_adapt_interval
 
         # A pinned value disables adaptation entirely: every bucket reports it
-        # and no measurement can move it.
+        # and no measurement can move it. `pinned_bits` fixes the precision too,
+        # since the controller no longer picks one.
         self.pinned: int | None = cfg.prefetch_topk or None
         if self.pinned is not None and not 1 <= self.pinned <= num_experts:
             raise ValueError(
                 f"prefetch_topk must be in [1, {num_experts}], got {self.pinned}."
             )
+        self._pinned_bits = cfg.prefetch_pin_bits
 
-        self._t_e_ms = t_e_ms
-        self._t_e_calibrated = t_e_ms
+        # Per-precision copy times, keyed by num_bits (NATIVE_BITS for bf16).
+        self._t_e_ms = dict(t_e_ms)
+        self._t_e_calibrated = dict(t_e_ms)
+        # Candidate precisions, fidelity-descending (16, 8, 4, 2): numeric order
+        # is fidelity order, so `k_bubble` rises monotonically down this list.
+        self._precisions = sorted(self._t_e_ms, reverse=True)
+        if self.pinned is not None and self._pinned_bits not in self._t_e_ms:
+            raise ValueError(
+                f"prefetch_pin_bits ({self._pinned_bits}) is not a staged "
+                f"precision; expected {NATIVE_BITS} (bf16) or a resident width "
+                f"in {sorted(b for b in self._t_e_ms if b != NATIVE_BITS)}."
+            )
         self._states: dict[int, BucketState] = {}
         self._accum: dict[int, _Accum] = {}
         self._forwards = 0
-        # Set by the last `step`, for logging only.
-        self._last_terms: dict[int, tuple[float, float]] = {}
+        # Set by the last `step`, for logging only: (k_poisson, k_bubbles by
+        # precision, chosen precision) per bucket.
+        self._last_terms: dict[int, tuple[float, dict[int, float], int]] = {}
 
     # ------------------------------------------------------------------
     # Read side
@@ -147,11 +168,20 @@ class PrefetchController:
         """Power-of-two bucket: 1->1, 2->2, 3..4->3, 5..8->4, ..."""
         return max(1, num_tokens).bit_length()
 
+    def select(self, num_tokens: int) -> tuple[int, int]:
+        """The (prefetch_top_k, precision) to stage for a batch of this size.
+
+        Precision is the width `step` chose for this bucket (NATIVE_BITS = bf16),
+        or the pinned width when adaptation is disabled.
+        """
+        if self.pinned is not None:
+            return self.pinned, self._pinned_bits
+        state = self._state_for(num_tokens)
+        return self._clamp_int(state.p), state.precision
+
     def topk_for(self, num_tokens: int) -> int:
         """How many experts per token to stage for a batch of this size."""
-        if self.pinned is not None:
-            return self.pinned
-        return self._clamp_int(self._state_for(num_tokens).p)
+        return self.select(num_tokens)[0]
 
     def _state_for(self, num_tokens: int) -> BucketState:
         return self._state_for_bucket(self.bucket(num_tokens))
@@ -217,20 +247,29 @@ class PrefetchController:
             t_comp_ms
         )
 
-    def observe_t_e(self, t_e_ms: float) -> None:
-        """Record a measured per-expert copy time, in milliseconds.
+    def observe_t_e(self, t_e_ms: dict[int, float]) -> None:
+        """Record measured per-expert copy times, per precision, in ms.
 
-        Clamped to a window around the startup calibration: this is measured
-        under contention with on-demand fetches, so a pathological interval can
-        report a wildly inflated rate, and letting that through would shrink the
-        bubble budget exactly when prefetching matters most.
+        Only the precision a forward actually staged at appears in `t_e_ms`; the
+        others keep their calibrated seed. Each is clamped to a window around its
+        own startup calibration: this is measured under contention with
+        on-demand fetches, so a pathological interval can report a wildly
+        inflated rate, and letting that through would shrink the bubble budget
+        exactly when prefetching matters most. Widths without a calibration
+        (never expected) are ignored.
         """
-        if self.pinned is not None or t_e_ms <= 0.0:
+        if self.pinned is not None:
             return
-        lo = self._t_e_calibrated * _TE_MIN_FACTOR
-        hi = self._t_e_calibrated * _TE_MAX_FACTOR
-        t_e_ms = min(max(t_e_ms, lo), hi)
-        self._t_e_ms = (1.0 - _TE_ALPHA) * self._t_e_ms + _TE_ALPHA * t_e_ms
+        for bits, sample in t_e_ms.items():
+            calibrated = self._t_e_calibrated.get(bits)
+            if sample <= 0.0 or calibrated is None:
+                continue
+            lo = calibrated * _TE_MIN_FACTOR
+            hi = calibrated * _TE_MAX_FACTOR
+            sample = min(max(sample, lo), hi)
+            self._t_e_ms[bits] = (
+                1.0 - _TE_ALPHA
+            ) * self._t_e_ms[bits] + _TE_ALPHA * sample
 
     def due_to_sample(self) -> bool:
         """Whether this forward pass should record timing events.
@@ -275,17 +314,27 @@ class PrefetchController:
 
         k_poisson = self._poisson_target(state.ema_acc)
 
-        k_bubble = 0.0
+        k_bubbles: dict[int, float] = {}
         if accum.t_comp_ms:
             t_comp = sum(accum.t_comp_ms) / len(accum.t_comp_ms)
             state.ema_t_comp_ms = self._ema(state.ema_t_comp_ms, t_comp, state.samples)
             staged_avg = accum.staged / accum.layers
-            k_bubble = self._bubble_target(state.ema_t_comp_ms, p_cur, staged_avg)
+            # `staged_avg` (the union ratio) and `t_comp` are
+            # precision-independent; only `t_e` varies, so one dict of bubble
+            # targets -- one per candidate precision -- covers every width.
+            k_bubbles = {
+                bits: self._bubble_target(
+                    state.ema_t_comp_ms, p_cur, staged_avg, self._t_e_ms[bits]
+                )
+                for bits in self._precisions
+            }
+
+        chosen_bits, p_raw = self._select_precision(k_poisson, k_bubbles)
 
         state.samples += accum.layers
-        self._last_terms[bucket] = (k_poisson, k_bubble)
+        state.precision = chosen_bits
+        self._last_terms[bucket] = (k_poisson, k_bubbles, chosen_bits)
 
-        p_raw = max(k_poisson, k_bubble)
         if accum.truncated:
             # The prefetch overflowed the cache and was cut down. Raising `p`
             # now would discard more of it, drop the hit rate further, and push
@@ -308,17 +357,44 @@ class PrefetchController:
 
         logger.debug(
             "[Prefetch] bucket=%d p=%.2f (%d) acc=%.3f k_poisson=%.2f "
-            "k_bubble=%.2f t_comp=%.3fms t_e=%.3fms%s",
+            "precision=%s k_bubbles=%s t_comp=%.3fms%s",
             bucket,
             state.p,
             self._clamp_int(state.p),
             state.ema_acc,
             k_poisson,
-            k_bubble,
+            "bf16" if chosen_bits == NATIVE_BITS else f"int{chosen_bits}",
+            {b: round(v, 2) for b, v in k_bubbles.items()},
             state.ema_t_comp_ms,
-            self._t_e_ms,
             " truncated" if accum.truncated else "",
         )
+
+    def _select_precision(
+        self, k_poisson: float, k_bubbles: dict[int, float]
+    ) -> tuple[int, float]:
+        """The precision to stage at, and the prefetch_top_k for it.
+
+        `k_bubble` rises as fidelity drops (a smaller blob copies faster, so more
+        fit under one layer's compute), so scanning fidelity-descending and
+        taking the first width whose `k_bubble >= k_poisson` yields
+        `min{k_opt1(p) : k_opt1(p) >= k_opt2}` at the highest such `p` -- the
+        best accuracy that still stages enough experts to cover the Poisson
+        target without a bubble. bf16 wins when the compute budget is large.
+
+        If no width qualifies (even the coarsest is too slow to cover the target
+        under compute), fall back to the coarsest resident width and the Poisson
+        target, accepting some bubble -- exactly `max(k_opt1, k_opt2)` with the
+        fastest precision. With quantization off, `_precisions` is just
+        [NATIVE_BITS] and this reduces to the original `max` at bf16.
+        """
+        if not k_bubbles:
+            # No compute-time sample yet: the bubble term is unsolved, so keep
+            # the highest fidelity and let the Poisson target drive `p`.
+            return NATIVE_BITS, k_poisson
+        for bits in self._precisions:  # fidelity-descending: 16, 8, 4, 2
+            if k_bubbles.get(bits, 0.0) >= k_poisson:
+                return bits, k_bubbles[bits]
+        return self._precisions[-1], k_poisson
 
     def _poisson_target(self, acc: float) -> float:
         """Experts per token worth staging at accuracy `acc`.
@@ -342,17 +418,17 @@ class PrefetchController:
         return max(self.top_k - e_max, 0.0)
 
     def _bubble_target(
-        self, t_comp_ms: float, p_cur: float, staged_avg: float
+        self, t_comp_ms: float, p_cur: float, staged_avg: float, t_e_ms: float
     ) -> float:
-        """Experts per token that fit under one layer's compute.
+        """Experts per token that fit under one layer's compute at this width.
 
-        `t_comp / t_e` counts *copies*, but `p` is per token and a batch stages
-        the union over its tokens, so the budget is converted through the
-        measured union size at the current `p`.
+        `t_comp / t_e` counts *copies* of a `t_e`-per-expert width, but `p` is
+        per token and a batch stages the union over its tokens, so the budget is
+        converted through the measured union size at the current `p`.
         """
-        if t_comp_ms <= 0.0 or self._t_e_ms <= 0.0 or staged_avg <= 0.0:
+        if t_comp_ms <= 0.0 or t_e_ms <= 0.0 or staged_avg <= 0.0:
             return 0.0
-        budget = t_comp_ms / self._t_e_ms
+        budget = t_comp_ms / t_e_ms
         # Cannot stage more than the cache can hold, however much time there is.
         budget = min(budget, float(self.num_slots))
         return p_cur * budget / staged_avg
@@ -368,19 +444,41 @@ class PrefetchController:
     # Introspection
     # ------------------------------------------------------------------
 
+    def _bits_label(self, bits: int) -> str:
+        return "bf16" if bits == NATIVE_BITS else f"int{bits}"
+
     def summary(self) -> str:
         if self.pinned is not None:
-            return f"[Prefetch] pinned top_k={self.pinned}"
+            return (
+                f"[Prefetch] pinned top_k={self.pinned} "
+                f"precision={self._bits_label(self._pinned_bits)}"
+            )
         parts = []
         for bucket in sorted(self._states):
             state = self._states[bucket]
-            poisson, bubble = self._last_terms.get(bucket, (0.0, 0.0))
+            poisson, k_bubbles, chosen = self._last_terms.get(
+                bucket, (0.0, {}, state.precision)
+            )
+            bubble = k_bubbles.get(chosen, 0.0)
             parts.append(
                 f"b{bucket}(n={1 << (bucket - 1)}..{(1 << bucket) - 1}): "
-                f"p={self._clamp_int(state.p)} "
+                f"p={self._clamp_int(state.p)}@{self._bits_label(chosen)} "
                 f"acc={state.ema_acc:.3f} poisson={poisson:.1f} bubble={bubble:.1f}"
             )
+        # Show every candidate precision's copy time and the raw bubble budget
+        # (t_comp / t_e, experts that fit under one layer's compute) it implies,
+        # at a representative t_comp -- so the widths the selector did *not*
+        # pick are still visible. bf16 covering the target is why it wins.
+        t_comp = max((s.ema_t_comp_ms for s in self._states.values()), default=0.0)
+        te = " ".join(
+            f"{self._bits_label(b)}(t_e={self._t_e_ms[b]:.3f}ms"
+            + (
+                f",budget={t_comp / self._t_e_ms[b]:.1f})"
+                if self._t_e_ms[b] > 0.0
+                else ")"
+            )
+            for b in self._precisions
+        )
         return (
-            f"[Prefetch] forwards={self._forwards} t_e={self._t_e_ms:.3f}ms | "
-            + " | ".join(parts)
+            f"[Prefetch] forwards={self._forwards} t_e=[{te}] | " + " | ".join(parts)
         )
