@@ -49,6 +49,11 @@ _MAX_STEP = 1.0
 # Below this many observed layers a bucket's statistics are too noisy to act on.
 _MIN_SAMPLES = 8
 
+# A fresh bucket with no neighbour to seed from starts at this fraction of
+# `max_topk` -- below the router's top_k so warmup does not over-stage before
+# the bubble/Poisson terms have any measurement to size `p`.
+_SEED_TOPK_FRACTION = 0.7
+
 # `t_e` is measured under contention with on-demand fetches, so it drifts with
 # `p`. Smooth it hard and never let it wander far from the startup calibration.
 _TE_ALPHA = 0.05
@@ -198,14 +203,15 @@ class PrefetchController:
 
         Adjacent buckets differ by a factor of two in token count, so their
         routing statistics are far closer than any constant would be. With
-        nothing to copy from, start at the top: over-staging costs bandwidth
-        that the bubble term was going to hand out anyway, while under-staging
-        costs synchronous on-demand fetches.
+        nothing to copy from, start at `_SEED_TOPK_FRACTION` of `max_topk` --
+        below the router's top_k so warmup does not over-stage before the
+        bubble/Poisson terms have any measurement to size `p`; the controller
+        raises it from there if either term asks for more.
         """
         if self._states:
             nearest = min(self._states, key=lambda b: abs(b - bucket))
             return self._states[nearest].p
-        return float(self.max_topk)
+        return self.max_topk * _SEED_TOPK_FRACTION
 
     def _clamp_int(self, p: float) -> int:
         return int(min(max(math.floor(p), self.min_topk), self.max_topk))

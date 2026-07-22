@@ -186,29 +186,29 @@ class ForwardStats:
 
 @dataclass
 class _TCompSample:
-    """Events for one layer's compute time, excluding H2D.
+    """Events bracketing one layer's compute, H2D excluded.
 
-    `t_comp = elapsed(issue, begin) - elapsed(prev_begin, prev_ready)`
+    `t_comp = elapsed(prev_ready, begin)` -- the compute-stream span from the
+    previous layer's resolve finishing (`prev_ready`, after its wait and any
+    on-demand fetches) to this layer's resolve starting (`begin`, before its
+    wait). That interval is exactly one layer's compute -- the previous layer's
+    MoE kernel plus this layer's attention and gating -- with both layers' H2D
+    stalls left out, which is the bubble a single prefetch can hide behind.
 
-    The first term is the whole window a prefetch had to hide behind: from when
-    it was issued, in the previous decoder layer, to when this layer's MoE block
-    needs the weights. The second subtracts the previous layer's dead time --
-    its stall waiting for its own prefetch, plus its on-demand fetches, which
-    are the only H2D on the compute stream.
+    Anchored at the previous *resolve*, not at when the prefetch was issued: a
+    prefetch driven by an `attn_input` predictor is issued a whole attention
+    block before that resolve, so measuring from the issue point would fold the
+    previous layer's attention into the window and roughly double `t_comp`.
     """
 
-    issue: torch.cuda.Event
     begin: torch.cuda.Event
-    prev_begin: torch.cuda.Event
     prev_ready: torch.cuda.Event
 
     def ready(self) -> bool:
         return self.begin.query() and self.prev_ready.query()
 
     def elapsed_ms(self) -> float:
-        window = self.issue.elapsed_time(self.begin)
-        dead = self.prev_begin.elapsed_time(self.prev_ready)
-        return window - dead
+        return self.prev_ready.elapsed_time(self.begin)
 
 
 LOG_ACCURACY = os.getenv("LOG_ACCURACY", "0") == "1"
@@ -445,11 +445,6 @@ class ExpertBuffer:
         self.copies_issued = threading.Event()
         self.copies_issued.set()
         self.prefetch_event: torch.cuda.Event | None = None
-
-        # Recorded on the compute stream when this buffer's prefetch was issued.
-        # Paired with the consuming `resolve` to measure how much compute the
-        # copies had to hide behind. None when timing is not being sampled.
-        self.issue_event: torch.cuda.Event | None = None
 
         # The predictor's top-`K` picks for this layer (K = the router's top_k,
         # not `prefetch_top_k`). Only used to measure accuracy: comparing the
@@ -1088,7 +1083,6 @@ class ExpertCache:
             buf.wait_until_ready()
             buf.staged_for = None
             buf.reference_ids = None
-            buf.issue_event = None
             if buf.num_slots:
                 buf.clear_ids()
         self.active_name = "ping"
@@ -1102,23 +1096,16 @@ class ExpertCache:
         event.record()
         return event
 
-    def _close_window(
-        self, buf: ExpertBuffer, begin: torch.cuda.Event | None
-    ) -> None:
+    def _close_window(self, begin: torch.cuda.Event | None) -> None:
         """Finish this layer's timing window and pair it with the last one."""
         if begin is None:
             return
         ready = torch.cuda.Event(enable_timing=True)
         ready.record()
-        if buf.issue_event is not None and self._prev_events is not None:
-            prev_begin, prev_ready = self._prev_events
+        if self._prev_events is not None:
+            _, prev_ready = self._prev_events
             self.stats.t_comp_events.append(
-                _TCompSample(
-                    issue=buf.issue_event,
-                    begin=begin,
-                    prev_begin=prev_begin,
-                    prev_ready=prev_ready,
-                )
+                _TCompSample(begin=begin, prev_ready=prev_ready)
             )
         self._prev_events = (begin, ready)
 
@@ -1283,8 +1270,9 @@ class ExpertCache:
             cached = self._resolve_misses(owner, buf, flat, cached, miss, needed)
 
         # Everything between `begin` and here is dead time: the D2H stall plus
-        # the on-demand copies. The next layer subtracts it.
-        self._close_window(buf, begin)
+        # the on-demand copies. The next layer's window starts at `ready`, so it
+        # is excluded rather than subtracted.
+        self._close_window(begin)
 
         # Ship the remapped ids back for the kernel (T*K ints); the MoE kernel
         # that follows is ordered after this H2D on the compute stream.
@@ -1411,7 +1399,6 @@ class ExpertCache:
         # the allocator only tracks the stream it was created on.
         expert_ids.record_stream(stream)
 
-        buf.issue_event = self._record_event()
         buf.maps_ready.clear()
         buf.copies_issued.clear()
         device = buf.device

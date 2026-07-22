@@ -212,7 +212,7 @@ class ExpertCacheOffloadConfig:
     engine instead of queueing behind the entire prefetch. 1 disables chunking.
     """
 
-    prefetch_ema_alpha: float = Field(default=0.2, gt=0, le=1)
+    prefetch_ema_alpha: float = Field(default=0.5, gt=0, le=1)
     """How fast the staged-expert count follows its target. Lower is steadier."""
 
     prefetch_min_topk: int = Field(default=1, ge=1)
