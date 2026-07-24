@@ -21,7 +21,9 @@ TOP_K = 4
 HIDDEN = 8
 INTERMEDIATE = 12
 NUM_LAYERS = 3
-NUM_SLOTS = 8
+# The cache must hold a whole layer (prefill routes to every expert), so a
+# partial cache is rejected at allocation and the buffers are full-size.
+NUM_SLOTS = NUM_EXPERTS
 
 
 class FakeRoutedExperts(nn.Module):
@@ -178,13 +180,14 @@ def test_stale_guard_is_load_bearing(cache_and_moes):
     assert not torch.equal(got, want), "guard is vacuous: stale read went unnoticed"
 
 
-def test_cache_too_small_raises(cache_and_moes):
+def test_whole_layer_resolves_without_eviction_pressure(cache_and_moes):
+    """A layer routing to every expert must fit: the allocation-time guard
+    (see `test_partial_cache_rejected_at_allocation`) exists precisely so this
+    prefill-shaped worst case cannot overflow at resolve time."""
     cache, moes = cache_and_moes
     cache.reset()
-    # More distinct experts in one layer than the cache has slots.
     topk_ids = torch.arange(NUM_EXPERTS, device="cuda").view(1, -1)
-    with pytest.raises(RuntimeError, match="Expert cache too small"):
-        cache.resolve(moes[0], topk_ids)
+    _assert_serves_correct_weights(cache, moes[0], topk_ids)
 
 
 def _allocate_with(num_slots=NUM_SLOTS, mutate=None):
@@ -210,10 +213,13 @@ def _allocate_with(num_slots=NUM_SLOTS, mutate=None):
         set_offloader(create_offloader(OffloadConfig()))
 
 
-def test_slots_below_top_k_rejected_at_allocation():
-    """A cache that cannot even hold one token's experts is never workable."""
-    with pytest.raises(ValueError, match="smaller than the layer's top_k"):
-        _allocate_with(num_slots=TOP_K - 1)
+@pytest.mark.parametrize("num_slots", [TOP_K - 1, NUM_EXPERTS - 1])
+def test_partial_cache_rejected_at_allocation(num_slots):
+    """A cache smaller than a whole layer cannot survive prefill (which routes
+    to every expert), so it is rejected up front rather than overflowing at
+    resolve time."""
+    with pytest.raises(ValueError, match="smaller than the layer's local_num_experts"):
+        _allocate_with(num_slots=num_slots)
 
 
 def _set_expert_map(moe):

@@ -251,10 +251,20 @@ def test_rank_unique_dedupes_across_tokens_keeping_best_score():
 
 
 def test_rank_unique_is_a_subset_of_the_union_of_per_token_topk():
+    """`_rank_unique` is fixed-shape: it returns exactly `top_k` experts, the
+    best-scoring of the union of every token's top-`top_k` (no longer the whole
+    union, whose length was data-dependent and cost a host sync)."""
     torch.manual_seed(0)
     logits = torch.randn(16, NUM_EXPERTS)
-    expected = set(torch.topk(logits, 3, dim=-1).indices.reshape(-1).tolist())
-    assert set(_rank_unique(logits, top_k=3).tolist()) == expected
+    union = set(torch.topk(logits, 3, dim=-1).indices.reshape(-1).tolist())
+    ranked = _rank_unique(logits, top_k=3)
+    assert ranked.numel() == 3
+    assert len(set(ranked.tolist())) == 3
+    assert set(ranked.tolist()) <= union
+    # At batch size 1 the candidates are one token's top-k, which are already
+    # distinct and descending -- so the result is exactly that top-k.
+    single = _rank_unique(logits[:1], top_k=3)
+    assert single.tolist() == torch.topk(logits[0], 3).indices.tolist()
 
 
 @pytest.mark.parametrize(

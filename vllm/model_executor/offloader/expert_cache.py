@@ -20,7 +20,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.expert_prefetch.expert_quant import (
     QUANT_STORE_ATTR,
     SUPPORTED_EXPERT_QUANT_BITS,
+    QuantizedExpertWeight,
+    blob_aliases,
     quantize_experts,
+)
+from vllm.model_executor.layers.expert_prefetch.shared_host_weights import (
+    DEFAULT_SHM_DIR,
+    SharedHostArena,
 )
 from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
 from vllm.utils.mem_utils import format_gib
@@ -45,6 +51,10 @@ class ExpertCacheOffloader(BaseOffloader):
             dtype. Each width builds a second pinned copy the cache can stage.
         quant_group_size: Scale group along the reduction dim, or -1 for one
             scale per row. Only used when `quant_bits` is non-empty.
+        worker_mode: "thread" keeps the host store in process-private pinned
+            memory. "process" places it in a `SharedHostArena` instead, so the
+            prefetch worker process can register and copy from the same pages.
+        shm_dir: Directory for the arena's backing files ("process" mode only).
     """
 
     def __init__(
@@ -53,6 +63,8 @@ class ExpertCacheOffloader(BaseOffloader):
         num_cache_slots: int = 0,
         quant_bits: tuple[int, ...] = (),
         quant_group_size: int = 128,
+        worker_mode: str = "thread",
+        shm_dir: str = DEFAULT_SHM_DIR,
     ):
         bad = sorted(b for b in set(quant_bits) if b not in SUPPORTED_EXPERT_QUANT_BITS)
         if bad:
@@ -72,6 +84,14 @@ class ExpertCacheOffloader(BaseOffloader):
         self.quant_bits = tuple(sorted(set(quant_bits), reverse=True))
         self.quant_group_size = quant_group_size
         self.pin_memory = should_pin_memory()
+        self.worker_mode = worker_mode
+        self.shm_dir = shm_dir
+        # In process mode the host store lives in shared memory instead of
+        # process-private pinned pages, so the worker process can reach it.
+        # Pinning then happens per process, via `SharedHostArena.register`.
+        self.arena: SharedHostArena | None = (
+            SharedHostArena(shm_dir) if worker_mode == "process" else None
+        )
         self.offloaded_bytes = 0
 
         # (owning module, dotted param name) rather than Parameter refs:
@@ -135,7 +155,23 @@ class ExpertCacheOffloader(BaseOffloader):
 
     def _to_host(self, data: torch.Tensor) -> torch.Tensor:
         cpu_data = data.to(device="cpu")
+        # In process mode the final home is the shared arena (post_init moves
+        # the tensor there and registration pins it); pinning here would only
+        # be thrown away with this interim copy.
+        if self.arena is not None:
+            return cpu_data
         return cpu_data.pin_memory() if self.pin_memory else cpu_data
+
+    def _arena_key(self, module: nn.Module, name: str) -> str:
+        """A stable, unique arena key for `module`'s parameter `name`.
+
+        The dotted `name` repeats across decoder layers, so the key is rooted
+        at the owning RoutedExperts' `layer_name` instead -- which is also how
+        the worker process finds the tensor again.
+        """
+        parent, _, leaf = name.rpartition(".")
+        target = module.get_submodule(parent) if parent else module
+        return f"{target.layer_name}.{leaf}"
 
     def post_init(self) -> None:
         """Re-pin offloaded parameters, then allocate the GPU caches.
@@ -147,9 +183,19 @@ class ExpertCacheOffloader(BaseOffloader):
         This runs after all of that, so it is the first point at which the
         parameters are both pinned-restorable and in their final runtime layout,
         which is exactly what the cache buffers have to mirror.
+
+        In process mode the parameters move into the shared arena here instead
+        (same timing, same reason), and the arena is registered -- the
+        process-mode analog of pinning -- once the quantized store has joined
+        it.
         """
-        self._repin()
+        if self.arena is None:
+            self._repin()
+        else:
+            self._move_to_arena()
         self._quantize_offloaded()
+        if self.arena is not None:
+            self.arena.register()
 
         for cache in self._caches:
             owner = cache.owner
@@ -159,6 +205,38 @@ class ExpertCacheOffloader(BaseOffloader):
                 quant_bits=self.quant_bits,
                 quant_group_size=self.quant_group_size,
             )
+            if self.arena is not None:
+                cache.start_process_worker(self.arena, self.shm_dir)
+
+        if self.arena is not None:
+            # Every worker has attached (its ready message arrived inside
+            # start_process_worker): the mappings keep the pages alive, so the
+            # names can go away now -- a crashed run leaks nothing in /dev/shm.
+            self.arena.unlink()
+
+    def _move_to_arena(self) -> None:
+        """Move every offloaded parameter into the shared arena, one at a time
+        so peak host memory stays one parameter above steady state (mirroring
+        `_repin`, which reallocates the same way)."""
+        arena = self.arena
+        assert arena is not None
+        # Everything that will land in the arena: the bf16 originals plus one
+        # quantized mirror per resident width (~bits/16 of the originals each,
+        # padded up a little for the interleaved scales).
+        quant_fraction = sum(bits / 16 * 1.05 for bits in self.quant_bits)
+        arena.check_capacity(int(self.offloaded_bytes * (1 + quant_fraction)))
+        moved = 0
+        for module, name in self._offloaded:
+            p = module.get_parameter(name)
+            if p.device.type != "cpu":
+                continue
+            p.data = arena.add(self._arena_key(module, name), p.data.contiguous())
+            moved += 1
+        logger.info(
+            "Expert cache: moved %d expert parameters (%s) into the shared host arena",
+            moved,
+            format_gib(arena.nbytes()),
+        )
 
     def _quantize_offloaded(self) -> None:
         """Build a pinned quantized mirror of every offloaded expert weight, one
@@ -191,9 +269,21 @@ class ExpertCacheOffloader(BaseOffloader):
                     bits,
                     self.quant_group_size,
                     device,
-                    self.pin_memory,
+                    # In process mode the blob's final home is the arena; a
+                    # pinned interim copy would be pure setup cost.
+                    self.pin_memory and self.arena is None,
                     name=leaf,
                 )
+                if self.arena is not None:
+                    key = f"{self._arena_key(module, name)}:int{bits}"
+                    blob = self.arena.add(key, store.blob)
+                    qweight, scale = blob_aliases(blob, store.layout)
+                    store = QuantizedExpertWeight(
+                        blob=blob,
+                        layout=store.layout,
+                        qweight=qweight,
+                        scale=scale,
+                    )
                 per_leaf[bits] = store
                 quantized_bytes += store.nbytes()
 

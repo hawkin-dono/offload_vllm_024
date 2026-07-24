@@ -115,12 +115,12 @@ def _enable_cache(layers, num_cache_slots):
 @pytest.mark.parametrize(
     "num_tokens,num_cache_slots",
     [
-        # Cache holds a whole layer: isolates slot remapping from eviction.
+        # The cache must hold a whole layer (a partial cache is rejected at
+        # allocation: prefill routes to every expert). Fetch-on-demand and
+        # eviction still get exercised through stale buffers, whose maps are
+        # dropped so every routed expert misses.
         (6, NUM_EXPERTS),
-        # Cache smaller than the layer, but still big enough for the worst case
-        # (num_tokens * TOP_K distinct experts): forces eviction between layers
-        # and fetch-on-demand within them.
-        (2, 2 * TOP_K),
+        (2, NUM_EXPERTS),
     ],
 )
 @pytest.mark.parametrize("prefetch", [False, True])
@@ -137,8 +137,10 @@ def test_cached_moe_matches_stock_moe(
         ]
 
         # Stock path: every expert resident on the GPU.
-        baseline = [_run_moe(layers[i], x, router_logits[i])[0].clone()
-                    for i in range(NUM_LAYERS)]
+        baseline = [
+            _run_moe(layers[i], x, router_logits[i])[0].clone()
+            for i in range(NUM_LAYERS)
+        ]
         assert layers[0].routed_experts.w13_weight.device.type == "cuda"
 
         # Cached path: expert weights now live in pinned CPU memory.
@@ -179,8 +181,10 @@ def test_cache_survives_repeated_forward_passes(moe_layers):
             torch.randn(4, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
             for _ in range(NUM_LAYERS)
         ]
-        baseline = [_run_moe(layers[i], x, router_logits[i])[0].clone()
-                    for i in range(NUM_LAYERS)]
+        baseline = [
+            _run_moe(layers[i], x, router_logits[i])[0].clone()
+            for i in range(NUM_LAYERS)
+        ]
 
         cache = _enable_cache(layers, NUM_EXPERTS)
         for step in range(3):

@@ -537,6 +537,8 @@ class EngineArgs:
     prefetch_num_chunks: int = ExpertCacheOffloadConfig.prefetch_num_chunks
     prefetch_ema_alpha: float = ExpertCacheOffloadConfig.prefetch_ema_alpha
     prefetch_min_topk: int = ExpertCacheOffloadConfig.prefetch_min_topk
+    prefetch_worker_mode: str = ExpertCacheOffloadConfig.prefetch_worker_mode
+    prefetch_shm_dir: str = ExpertCacheOffloadConfig.prefetch_shm_dir
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1277,6 +1279,12 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--prefetch-min-topk", **expert_cache_kwargs["prefetch_min_topk"]
+        )
+        offload_group.add_argument(
+            "--prefetch-worker-mode", **expert_cache_kwargs["prefetch_worker_mode"]
+        )
+        offload_group.add_argument(
+            "--prefetch-shm-dir", **expert_cache_kwargs["prefetch_shm_dir"]
         )
 
         # Multimodal related configs
@@ -2377,6 +2385,8 @@ class EngineArgs:
                 prefetch_num_chunks=self.prefetch_num_chunks,
                 prefetch_ema_alpha=self.prefetch_ema_alpha,
                 prefetch_min_topk=self.prefetch_min_topk,
+                prefetch_worker_mode=self.prefetch_worker_mode,
+                prefetch_shm_dir=self.prefetch_shm_dir,
             ),
         )
 

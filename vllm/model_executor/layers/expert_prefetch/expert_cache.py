@@ -24,197 +24,45 @@ bookkeeping kernels on the compute stream. Experts predicted incorrectly are
 simply cache misses: they get fetched on demand, which is correct but synchronous.
 """
 
-import os
-import re
-import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.expert_prefetch.accuracy import (
+    LOG_ACCURACY,
+    accuracy_tracker,
+)
+from vllm.model_executor.layers.expert_prefetch.constants import (
+    DEQUANT_RING_SLOTS,
+    NATIVE_BITS,
+)
+from vllm.model_executor.layers.expert_prefetch.dequant_staging import DequantStaging
+from vllm.model_executor.layers.expert_prefetch.expert_buffer import ExpertBuffer
 from vllm.model_executor.layers.expert_prefetch.expert_quant import (
-    MAX_EXPERT_QUANT_BITS,
     QUANT_STORE_ATTR,
     ExpertQuantSpec,
-    QuantBlobLayout,
-    blob_aliases,
-    dequant_experts_into_,
     validate_quantizable,
+)
+from vllm.model_executor.layers.expert_prefetch.stats import (
+    CacheStats,
+    ForwardStats,
+    _TCompSample,
 )
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.expert_prefetch.prefetch_process import (
+        PrefetchProcessClient,
+    )
+    from vllm.model_executor.layers.expert_prefetch.shared_host_weights import (
+        SharedHostArena,
+    )
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 logger = init_logger(__name__)
-
-EMPTY_SLOT = -1
-
-# Bit width standing for the native (bf16) originals. Always a prefetch
-# candidate, costs no extra memory, and takes the plain per-slot copy path.
-NATIVE_BITS = 16
-
-# Experts a dequant ring holds before recycling. Sized in bytes at the widest
-# supported width so one ring serves int8/int4/int2 alike.
-DEQUANT_RING_SLOTS = 16
-
-
-class DequantStaging:
-    """Small GPU ring the packed experts land in before being unpacked.
-
-    Quantization only ever shrinks what crosses PCIe; the MoE kernel still reads
-    bf16, so every staged expert has to be dequantized into an `ExpertBuffer`
-    slot anyway. That makes the packed bytes *transient* -- alive only between
-    an expert's H2D copy and the dequant kernel that reads it -- so they do not
-    need a slot per cache slot, and they do not need a buffer per bit width.
-    One ring of `num_slots` experts, sized in bytes at the widest supported
-    width, serves every resident width at once: at 128 cache slots that is
-    ~150 MiB instead of the ~2 GiB a full-size buffer per width would cost.
-
-    A fetch walks its experts a ring-full at a time. Copies and dequant are
-    issued on the *same* stream, so the copies of chunk k+1 are ordered behind
-    the dequant of chunk k that reads those ring slots -- the write-after-read
-    hazard is handled by stream order alone, with no events to get wrong.
-
-    One ring cannot be shared by the whole cache, though: `ExpertCache.prefetch`
-    runs on a side stream while `ExpertCache.resolve` fetches misses on the
-    compute stream, and the two overlap in time. Each path owns one.
-    """
-
-    def __init__(self, name: str, num_slots: int = DEQUANT_RING_SLOTS):
-        self.name = name
-        self.num_slots = num_slots
-        # Packed blobs, keyed by param name: (num_slots, blob_bytes) uint8,
-        # sized at the widest bit width.
-        self.blobs: dict[str, torch.Tensor] = {}
-        # {name: {num_bits: landing}} -- the blob rows trimmed to what a store
-        # of that width occupies, so an H2D copy is one contiguous row-sized
-        # transfer. A narrower store leaves the tail of each ring row untouched.
-        self.landing: dict[str, dict[int, torch.Tensor]] = {}
-        # {name: {num_bits: (qweight, scale)}} -- strided aliases of the blob,
-        # built once here so a fetch never re-derives them.
-        self._aliases: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-        # Ring slot indices, sliced per chunk; kept on device so a fetch does
-        # not have to build one.
-        self.slot_index: torch.Tensor = torch.empty(0, dtype=torch.int32)
-
-    def allocate(
-        self,
-        shapes: dict[str, tuple[int, int, int]],
-        bits: tuple[int, ...],
-        device: torch.device,
-    ) -> None:
-        """Size the ring from `shapes` ({name: (rows, cols, num_groups)}).
-
-        Rows/cols/num_groups are the same across widths (they depend on the
-        weight shape and group size, not the bit width), so the ring is built
-        once at `MAX_EXPERT_QUANT_BITS` and every resident width's landing and
-        aliases address the same storage.
-        """
-        for name, (rows, cols, num_groups) in shapes.items():
-            widest = QuantBlobLayout(
-                rows=rows,
-                cols=cols,
-                num_bits=MAX_EXPERT_QUANT_BITS,
-                num_groups=num_groups,
-            )
-            blob = torch.zeros(
-                (self.num_slots, widest.blob_bytes), dtype=torch.uint8, device=device
-            )
-            self.blobs[name] = blob
-            self.landing[name] = {}
-            self._aliases[name] = {}
-            for num_bits in bits:
-                layout = QuantBlobLayout(
-                    rows=rows, cols=cols, num_bits=num_bits, num_groups=num_groups
-                )
-                self.landing[name][num_bits] = blob[:, : layout.blob_bytes]
-                self._aliases[name][num_bits] = blob_aliases(blob, layout)
-        self.slot_index = torch.arange(self.num_slots, dtype=torch.int32, device=device)
-
-    def aliases(self, name: str, num_bits: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """The (qweight, scale) views of `name`'s ring at `num_bits`."""
-        return self._aliases[name][num_bits]
-
-    def landing_for(self, name: str, num_bits: int) -> torch.Tensor:
-        """The landing region of `name`'s ring at `num_bits`."""
-        return self.landing[name][num_bits]
-
-    def nbytes(self) -> int:
-        return sum(blob.numel() for blob in self.blobs.values())
-
-
-@dataclass
-class CacheStats:
-    """One forward pass of measurements, for `PrefetchController`.
-
-    All host-side ints: the resolve decision runs on the CPU, so the hit/needed
-    tallies are already on the host and never touch the device.
-    """
-
-    # Summed over the layers that ran against a prefetched buffer.
-    hits: int = 0
-    needed: int = 0
-    # Hits the predictor's full top-`K` picks *would* have got. The accuracy the
-    # Poisson model wants, uncontaminated by how much we chose to stage.
-    reference_hits: int = 0
-    staged: int = 0
-    layers: int = 0
-    truncated: bool = False
-    # Unread (start, end) event pairs; drained lazily, a forward pass later.
-    t_comp_events: list["_TCompSample"] = field(default_factory=list)
-
-
-@dataclass
-class ForwardStats:
-    """What one forward pass measured, read off the device exactly once."""
-
-    hits: int
-    reference_hits: int
-    needed: int
-    staged: int
-    layers: int
-    truncated: bool
-    t_comp_ms: list[float]
-    # Per-expert copy time in ms, keyed by the precision (num_bits) that staged.
-    # NATIVE_BITS is the bf16 copy; only widths a forward actually ran appear.
-    t_e_ms: dict[int, float]
-
-
-@dataclass
-class _TCompSample:
-    """Events bracketing one layer's compute, H2D excluded.
-
-    `t_comp = elapsed(prev_ready, begin)` -- the compute-stream span from the
-    previous layer's resolve finishing (`prev_ready`, after its wait and any
-    on-demand fetches) to this layer's resolve starting (`begin`, before its
-    wait). That interval is exactly one layer's compute -- the previous layer's
-    MoE kernel plus this layer's attention and gating -- with both layers' H2D
-    stalls left out, which is the bubble a single prefetch can hide behind.
-
-    Anchored at the previous *resolve*, not at when the prefetch was issued: a
-    prefetch driven by an `attn_input` predictor is issued a whole attention
-    block before that resolve, so measuring from the issue point would fold the
-    previous layer's attention into the window and roughly double `t_comp`.
-    """
-
-    begin: torch.cuda.Event
-    prev_ready: torch.cuda.Event
-
-    def ready(self) -> bool:
-        return self.begin.query() and self.prev_ready.query()
-
-    def elapsed_ms(self) -> float:
-        return self.prev_ready.elapsed_time(self.begin)
-
-
-LOG_ACCURACY = os.getenv("LOG_ACCURACY", "0") == "1"
-ACCURACY_LOG_INTERVAL = int(os.getenv("ACCURACY_LOG_INTERVAL", "1"))
-# When set, the per-forward accuracy summary is also appended to this file.
-ACCURACY_LOG_FILE = os.getenv("ACCURACY_LOG_FILE", "/tmp/vllm_expert_accuracy.log")
 
 
 def _chunk_bounds(n: int, num_chunks: int) -> list[tuple[int, int]]:
@@ -224,167 +72,6 @@ def _chunk_bounds(n: int, num_chunks: int) -> list[tuple[int, int]]:
         return []
     size = -(-n // num_chunks)  # ceil, so the last chunk is the short one
     return [(lo, min(lo + size, n)) for lo in range(0, n, size)]
-
-
-def _layer_index(layer_name: str) -> int:
-    """Best-effort decoder-layer index from a param prefix, for ordered logs."""
-    match = re.search(r"layers\.(\d+)", layer_name)
-    return int(match.group(1)) if match else -1
-
-
-class AccuracyTracker:
-    """Accumulates prefetch accuracy overall and per MoE layer.
-
-    For each MoE layer the cache reports how many of the experts the layer
-    actually routed to (`needed`) had already been staged by the predictor
-    (`hits`). The hit rate is the prediction accuracy: 1.0 means every routed
-    expert was prefetched, 0.0 means all were fetched on demand.
-
-    `record_topk` adds the other half of the picture: the `prefetch_top_k` the
-    controller chose for that layer. Reading accuracy without it is misleading,
-    since a layer scoring badly because the predictor was wrong and one scoring
-    badly because we deliberately staged two experts look identical.
-    """
-
-    def __init__(self) -> None:
-        self._hits: dict[str, int] = {}
-        self._needed: dict[str, int] = {}
-        self._topk_sum: dict[str, int] = {}
-        self._topk_count: dict[str, int] = {}
-        # Running means of the two times the controller solves against: how long
-        # one layer computes for, and how long one expert takes to copy in.
-        self._t_comp_sum = 0.0
-        self._t_comp_count = 0
-        # Per-precision (num_bits) running copy-time sums; NATIVE_BITS for bf16.
-        self._t_e_sum: dict[int, float] = {}
-        self._t_e_count: dict[int, int] = {}
-        self._forwards = 0
-
-    def update(self, layer_name: str, hits: int, needed: int) -> None:
-        with open(ACCURACY_LOG_FILE, "a") as f:
-            f.write(f"Layer {layer_name}: hits={hits}, needed={needed}\n")
-        self._hits[layer_name] = self._hits.get(layer_name, 0) + hits
-        self._needed[layer_name] = self._needed.get(layer_name, 0) + needed
-
-    def record_topk(self, layer_name: str, prefetch_top_k: int) -> None:
-        """Record the `prefetch_top_k` one layer's prefetch was issued at.
-
-        Keyed by the layer being *staged*, not the layer whose hidden state fed
-        the predictor, so it lines up with the accuracy the same layer reports
-        from `resolve`. Kept as a mean rather than a single value: the
-        controller picks per batch-size bucket, so a run that mixes batch sizes
-        genuinely has more than one.
-        """
-        self._topk_sum[layer_name] = (
-            self._topk_sum.get(layer_name, 0) + prefetch_top_k
-        )
-        self._topk_count[layer_name] = self._topk_count.get(layer_name, 0) + 1
-
-    def mean_topk(self, layer_name: str) -> float | None:
-        """The mean `prefetch_top_k` for one layer, or None if never staged."""
-        count = self._topk_count.get(layer_name, 0)
-        return self._topk_sum[layer_name] / count if count else None
-
-    def record_timings(
-        self, t_comp_ms: list[float], t_e_ms: dict[int, float]
-    ) -> None:
-        """Record one forward's compute and per-precision copy times, in ms.
-
-        Not per layer: `t_comp_ms` arrives as a flat list of per-layer windows
-        with no layer attached, and `t_e_ms` is a property of the link (per
-        precision) rather than of any one layer. Both are also drained lazily --
-        an event that had not completed by the last drain is reported a forward
-        or two late -- so these are running means over the whole run, not this
-        pass's values.
-        """
-        self._t_comp_sum += sum(t_comp_ms)
-        self._t_comp_count += len(t_comp_ms)
-        for bits, t in t_e_ms.items():
-            if t > 0.0:
-                self._t_e_sum[bits] = self._t_e_sum.get(bits, 0.0) + t
-                self._t_e_count[bits] = self._t_e_count.get(bits, 0) + 1
-
-    def on_forward_end(self, interval: int = ACCURACY_LOG_INTERVAL) -> None:
-        """Log the running accuracy every `interval` forward passes."""
-        self._forwards += 1
-        if interval and self._forwards % interval == 0:
-            self.log()
-
-    def overall(self) -> float:
-        hits = sum(self._hits.values())
-        needed = sum(self._needed.values())
-        return hits / needed if needed else 0.0
-
-    def _topk_suffix(self, layer_name: str) -> str:
-        """`/k<mean>` for a staged layer, empty for one that never was.
-
-        The absence is the useful part: a layer with no suffix was never
-        prefetched at all -- no predictor, or its prefetch never landed -- which
-        is a different failure from one that was staged and mispredicted.
-        """
-        mean = self.mean_topk(layer_name)
-        return f"/k{mean:.1f}" if mean is not None else ""
-
-    def log(self) -> None:
-        if not self._needed:
-            return
-        per_layer = " ".join(
-            f"L{_layer_index(name)}="
-            f"{self._hits[name] / self._needed[name]:.2f}"
-            f"{self._topk_suffix(name)}"
-            for name in sorted(self._needed, key=_layer_index)
-            if self._needed[name]
-        )
-        staged = sum(self._topk_count.values())
-        overall_topk = sum(self._topk_sum.values()) / staged if staged else 0.0
-        t_comp = (
-            self._t_comp_sum / self._t_comp_count if self._t_comp_count else 0.0
-        )
-        # `t_comp/t_e(p)` is the bubble budget the controller solves against per
-        # precision: how many expert copies of that width fit under one layer's
-        # compute. Printed per width so a `p` that looks wrong can be traced to
-        # whichever term produced it.
-        te_parts = []
-        for bits in sorted(self._t_e_sum, reverse=True):
-            count = self._t_e_count.get(bits, 0)
-            if not count:
-                continue
-            t_e = self._t_e_sum[bits] / count
-            budget = t_comp / t_e if t_e > 0.0 else 0.0
-            label = "bf16" if bits == NATIVE_BITS else f"int{bits}"
-            te_parts.append(f"{label}(t_e={t_e:.3f}ms,budget={budget:.1f})")
-        te_str = " ".join(te_parts) if te_parts else "n/a"
-        summary = (
-            f"[ExpertAcc] forwards={self._forwards} overall={self.overall():.3f} "
-            f"(hits={sum(self._hits.values())}, "
-            f"needed={sum(self._needed.values())}) topk={overall_topk:.1f} "
-            f"t_comp={t_comp:.3f}ms t_e=[{te_str}] "
-            f"| {per_layer}"
-        )
-        logger.info("%s", summary)
-        if ACCURACY_LOG_FILE:
-            try:
-                with open(ACCURACY_LOG_FILE, "a") as f:
-                    f.write(summary + "\n")
-            except OSError as e:
-                logger.warning("Could not write accuracy log to %s: %s",
-                               ACCURACY_LOG_FILE, e)
-
-    def reset(self) -> None:
-        self._hits.clear()
-        self._needed.clear()
-        self._topk_sum.clear()
-        self._topk_count.clear()
-        self._t_comp_sum = 0.0
-        self._t_comp_count = 0
-        self._t_e_sum.clear()
-        self._t_e_count.clear()
-        self._forwards = 0
-
-
-# Global tracker, mirroring offload_vllm: `resolve` records into it and the
-# model's forward-end hook logs it. A single instance is shared across layers.
-accuracy_tracker = AccuracyTracker()
 
 
 def maybe_create_expert_cache(
@@ -406,248 +93,6 @@ def maybe_create_expert_cache(
     # weights are not in their final runtime layout until then.
     offloader.register_expert_cache(cache)
     return cache
-
-
-class ExpertBuffer:
-    """One side of the ping-pong cache: GPU storage for `num_slots` experts."""
-
-    def __init__(self, name: str, param_names: tuple[str, ...]):
-        self.name = name
-        self.param_names = param_names
-        self.num_slots = 0
-
-        # Staged expert weights, keyed by the RoutedExperts param name they
-        # shadow (e.g. "w13_weight"). Shape (num_slots, *expert_shape).
-        self.params: dict[str, torch.Tensor] = {}
-
-        # Slot<->expert maps, kept on the HOST as numpy arrays: the whole resolve
-        # decision (remap, miss detection, eviction) runs on the CPU at decode,
-        # so nothing here is a GPU tensor. `slot_to_expert[slot]` = the global
-        # expert id staged in that slot (or EMPTY_SLOT); `expert_to_slot[e]` =
-        # the slot holding expert `e` (or EMPTY_SLOT). The prefetch worker fills
-        # them from the ids it already has on CPU.
-        self.slot_to_expert: np.ndarray = np.empty(0, dtype=np.int32)
-        self.expert_to_slot: np.ndarray = np.empty(0, dtype=np.int32)
-        # The accelerator the weight buffers live on; set in `allocate`.
-        self.device: torch.device | None = None
-
-        # Which MoE layer the staged weights belong to. Buffers are recycled
-        # across layers, so an id table alone is not enough to trust a slot:
-        # slot 3 may well hold "expert 7", but expert 7 *of a previous layer*.
-        # Every read checks this before treating a slot as a hit.
-        self.staged_for: str | None = None
-
-        # A prefetch is issued from a worker thread, so readiness has two parts:
-        # `copies_issued` (the thread finished enqueuing the copies) and
-        # `prefetch_event` (the GPU finished executing them).
-        self.maps_ready = threading.Event()
-        self.maps_ready.set()
-        self.copies_issued = threading.Event()
-        self.copies_issued.set()
-        self.prefetch_event: torch.cuda.Event | None = None
-
-        # The predictor's top-`K` picks for this layer (K = the router's top_k,
-        # not `prefetch_top_k`). Only used to measure accuracy: comparing the
-        # *staged* set against what the layer routed to would conflate the
-        # predictor being wrong with us having deliberately staged less, and the
-        # Poisson model needs the former on its own.
-        self.reference_ids: np.ndarray | None = None
-
-    def allocate(
-        self,
-        owner: "RoutedExperts",
-        num_slots: int,
-        device: torch.device,
-    ) -> None:
-        self.num_slots = num_slots
-        self.device = device
-        for name in self.param_names:
-            src = getattr(owner, name)
-            self.params[name] = torch.zeros(
-                (num_slots, *src.shape[1:]),
-                dtype=src.dtype,
-                device=device,
-            )
-        self.slot_to_expert = np.full(num_slots, EMPTY_SLOT, dtype=np.int32)
-        self.expert_to_slot = np.full(
-            owner.global_num_experts, EMPTY_SLOT, dtype=np.int32
-        )
-
-    def stage_ids(self, expert_ids: np.ndarray) -> None:
-        """Record that slots 0..len-1 now hold `expert_ids` (host-side only).
-
-        Called by the prefetch worker from the ids it already has on CPU, so the
-        maps `resolve` reads are ready without any GPU round-trip.
-        """
-        n = len(expert_ids)
-        self.slot_to_expert[:] = EMPTY_SLOT
-        self.slot_to_expert[:n] = expert_ids
-        self.expert_to_slot[:] = EMPTY_SLOT
-        if n:
-            self.expert_to_slot[expert_ids] = np.arange(n, dtype=np.int32)
-
-    def clear_ids(self) -> None:
-        """Drop the slot<->expert maps: every expert becomes a miss."""
-        self.slot_to_expert[:] = EMPTY_SLOT
-        self.expert_to_slot[:] = EMPTY_SLOT
-
-    def wait_maps_ready(self) -> None:
-        """Block (host-side) until the slot<->expert maps are published.
-
-        The worker fills the maps and sets `maps_ready` up front -- before
-        enqueuing the staging copies -- so this is all `resolve` needs to remap
-        `topk_ids` on the host, and it returns without waiting for the (MiB) H2D
-        to execute. It does NOT imply the copies are enqueued or `prefetch_event`
-        is recorded; the weights are gated separately by `wait_prefetch_event`,
-        which a caller reaches only after `copies_issued`.
-        """
-        self.maps_ready.wait()
-
-    def wait_prefetch_event(self) -> None:
-        """Make the current (compute) stream wait for the staged copies to land.
-
-        GPU-side only: enqueues a wait on the compute stream and returns without
-        blocking the host. `prefetch_event` is recorded by the worker only after
-        the copies are enqueued (well after `maps_ready`), so a caller must first
-        ensure the worker has got that far -- via `copies_issued` -- before
-        relying on this; otherwise the event may still be unset and the wait a
-        silent no-op.
-        """
-        if self.prefetch_event is not None:
-            torch.cuda.current_stream().wait_event(self.prefetch_event)
-            self.prefetch_event = None
-
-    def wait_until_ready(self) -> None:
-        """Block until this buffer's staged weights are usable.
-
-        Waits for the worker thread to finish enqueuing copies, then makes the
-        current stream wait on the copy stream. Cheap when no prefetch is in
-        flight, since both events are already set.
-        """
-        self.copies_issued.wait()
-        self.wait_prefetch_event()
-
-    def copy_expert(
-        self,
-        owner: "RoutedExperts",
-        slot_id: int,
-        expert_id: int,
-    ) -> None:
-        """Copy a single expert from pinned CPU storage into `slot_id`.
-
-        The copy is async only because each `src[expert_id]` is a *view* into
-        the pinned CPU storage the offloader set up. Gathering the rows first
-        (`src[expert_ids]`) would allocate a new, unpinned tensor and silently
-        make the copy synchronous — do not "optimize" this into a batched index.
-        """
-        for name in self.param_names:
-            src = getattr(owner, name)
-            self.params[name][slot_id].copy_(src[expert_id], non_blocking=True)
-
-    def _dequant_chunk(
-        self,
-        owner: "RoutedExperts",
-        staging: "DequantStaging",
-        num_bits: int,
-        group_size: int,
-        experts: list[int],
-        slots: list[int],
-    ) -> None:
-        """Stage one ring-full: copy the packed blobs in, then dequant them out.
-
-        `experts`/`slots` hold at most `staging.num_slots` expert ids and their
-        destination cache slots. Each expert crosses the bus as a single blob
-        (packed weights and scales together, which is why the store interleaves
-        them); one kernel per parameter then unpacks the ring into `params`.
-        Both are issued on the caller's current stream, so the dequant orders
-        after the copies and the next chunk's copies order after this dequant --
-        the ring write-after-read hazard is stream order alone.
-        """
-        store = owner.__dict__[QUANT_STORE_ATTR]
-        for ring_slot, expert_id in enumerate(experts):
-            for name in self.param_names:
-                staging.landing_for(name, num_bits)[ring_slot].copy_(
-                    store[name][num_bits].blob[expert_id], non_blocking=True
-                )
-        # Built here, not hoisted: the allocator attributes it to whichever
-        # stream is current at this point, which is the one the kernel runs on.
-        dst_index = torch.tensor(slots, dtype=torch.int32, device=self.device)
-        src_index = staging.slot_index[: len(experts)]
-        for name in self.param_names:
-            packed, scale = staging.aliases(name, num_bits)
-            dequant_experts_into_(
-                packed,
-                scale,
-                self.params[name],
-                src_index,
-                group_size,
-                num_bits,
-                dst_index,
-            )
-
-    def fetch(
-        self,
-        owner: "RoutedExperts",
-        expert_ids: np.ndarray,
-        slot_ids: np.ndarray,
-        staging: "DequantStaging | None" = None,
-        num_bits: int = NATIVE_BITS,
-        group_size: int = 128,
-    ) -> None:
-        """Copy `expert_ids` from CPU into `slot_ids` of this buffer.
-
-        At `NATIVE_BITS` the bf16 originals are copied per slot. Otherwise the
-        experts are staged a ring-full at a time through `staging`: the small
-        quantized blob crosses PCIe and is unpacked on the GPU into the same
-        bf16 `params` slots the MoE kernel reads.
-        """
-        experts = expert_ids.tolist()
-        slots = slot_ids.tolist()
-        if num_bits == NATIVE_BITS:
-            for slot_id, expert_id in zip(slots, experts):
-                self.copy_expert(owner, slot_id, expert_id)
-            return
-        if staging is None:
-            raise ValueError("A quantized fetch needs a DequantStaging ring.")
-        chunk = staging.num_slots
-        for start in range(0, len(experts), chunk):
-            self._dequant_chunk(
-                owner,
-                staging,
-                num_bits,
-                group_size,
-                experts[start : start + chunk],
-                slots[start : start + chunk],
-            )
-
-    def warmup_dequant(
-        self, staging: "DequantStaging", bits: tuple[int, ...], group_size: int
-    ) -> None:
-        """Compile the dequant kernel here, on the calling thread, per width.
-
-        Otherwise the first launch happens inside the prefetch worker while
-        `copies_issued` is cleared, stalling the consumer for the whole Triton
-        compile -- and possibly racing a concurrent compile from the
-        fetch-on-demand path. The kernel cache is keyed by the constexpr bits /
-        group / block, so one launch per resident width compiles the variants
-        both rings and the on-demand path reuse. Writing garbage into ring slot
-        0 is safe: every cache slot is EMPTY_SLOT until a real fetch overwrites
-        it.
-        """
-        slot_index = staging.slot_index[:1]
-        for num_bits in bits:
-            for name in self.param_names:
-                packed, scale = staging.aliases(name, num_bits)
-                dequant_experts_into_(
-                    packed,
-                    scale,
-                    self.params[name],
-                    slot_index,
-                    group_size,
-                    num_bits,
-                    slot_index,
-                )
-        torch.cuda.current_stream().synchronize()
 
 
 class ExpertCache:
@@ -683,11 +128,15 @@ class ExpertCache:
         self.ondemand_staging = DequantStaging("on-demand")
 
         self._owner: RoutedExperts | None = None
+        self._layer_names: list[str] = []
         # Single worker: prefetches are issued in layer order and a second one
         # cannot start until the previous buffer has been consumed anyway.
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="expert-prefetch"
         )
+        # In process mode the staging runs in a separate process instead of
+        # the executor; see `start_process_worker`.
+        self._process_client: PrefetchProcessClient | None = None
 
         # Prefetch accuracy: of the experts a layer turned out to need, how many
         # were already staged. Host-side ints -- the resolve decision is on CPU.
@@ -788,6 +237,7 @@ class ExpertCache:
         if not routed_experts:
             raise ValueError("ExpertCache.bind requires at least one MoE layer.")
         self._owner = routed_experts[0]
+        self._layer_names = [layer.layer_name for layer in routed_experts]
         for layer in routed_experts:
             # Bypass nn.Module.__setattr__ so the shared cache does not become a
             # submodule of every layer (which would duplicate it in state_dict,
@@ -910,6 +360,51 @@ class ExpertCache:
             staging_note,
         )
 
+    def start_process_worker(
+        self, arena: "SharedHostArena", shm_dir: str
+    ) -> None:
+        """Spawn the prefetch worker process and route prefetches to it.
+
+        Called by the offloader's `post_init` right after `allocate`, when the
+        host store already lives in `arena` (shared memory both processes can
+        register). The thread executor stays around but is bypassed.
+        """
+        if not self.allocated:
+            raise RuntimeError("start_process_worker called before allocate().")
+        from vllm.model_executor.layers.expert_prefetch.prefetch_process import (
+            PrefetchProcessClient,
+        )
+
+        owner = self.owner
+        quant_shapes: dict[str, tuple[int, int, int]] = {}
+        if self.quant_bits:
+            store = owner.__dict__[QUANT_STORE_ATTR]
+            quant_shapes = {
+                name: (
+                    store[name][self.quant_bits[0]].layout.rows,
+                    store[name][self.quant_bits[0]].layout.cols,
+                    store[name][self.quant_bits[0]].layout.num_groups,
+                )
+                for name in self.param_names
+            }
+        client = PrefetchProcessClient(
+            param_names=self.param_names,
+            layer_names=self._layer_names,
+            num_slots=self.num_slots,
+            num_experts=owner.global_num_experts,
+            shm_dir=shm_dir,
+            quant_bits=self.quant_bits,
+            quant_group_size=self.quant_group_size,
+            quant_shapes=quant_shapes,
+        )
+        client.start([self.ping, self.pong], arena, self.ping.device)
+        self._process_client = client
+
+    def shutdown(self) -> None:
+        """Stop the worker process, if one is running. Safe to call twice."""
+        if self._process_client is not None:
+            self._process_client.shutdown()
+
     def calibrate_copy_time(
         self, num_samples: int = 8, warmup: int = 2
     ) -> dict[int, float]:
@@ -1007,6 +502,11 @@ class ExpertCache:
         All counters are host ints (the resolve decision is on CPU), so this is
         free -- no device sync.
         """
+        if self._process_client is not None:
+            # Copy-time samples measured in the worker process; the count word
+            # guards freshness, so this never races the worker's writes.
+            self._process_client.drain_copy_times(self._copy_times)
+
         stats = self.stats
         # Partitioned in one pass: `ready()` is a live device query, so asking
         # twice can see an event complete in between and drop it unread.
@@ -1381,6 +881,12 @@ class ExpertCache:
         """
         buf = self.inactive
 
+        client = self._process_client
+        if client is not None and not client.usable:
+            # Worker process died: flags stay set, staged state stays
+            # invalidated, every layer keeps degrading to on-demand misses.
+            return
+
         if expert_ids.numel() > buf.num_slots:
             expert_ids = expert_ids[: buf.num_slots]
 
@@ -1392,7 +898,8 @@ class ExpertCache:
         # (each buffer is re-staged only every other layer, after being consumed),
         # so no explicit wait for the previous copy is needed here -- and doing
         # one would stall the compute stream, which is exactly what we are
-        # removing.
+        # removing. In process mode the same fence is what lets the worker's
+        # `ids_ready` sync double as the write-after-read guard.
         stream.wait_stream(torch.cuda.current_stream())
 
         # Keep `expert_ids` alive until the copy stream is done with it, since
@@ -1401,6 +908,19 @@ class ExpertCache:
 
         buf.maps_ready.clear()
         buf.copies_issued.clear()
+        if client is not None:
+            client.submit_prefetch(
+                buf,
+                0 if buf is self.ping else 1,
+                owner,
+                expert_ids,
+                stream,
+                num_chunks,
+                reference_ids,
+                num_bits,
+                self._sampling,
+            )
+            return
         device = buf.device
         self._executor.submit(
             self._prefetch_worker,
@@ -1432,18 +952,24 @@ class ExpertCache:
             # `resolve` after `maps_ready`, so it must be set before that fires.
             buf.staged_for = owner.layer_name
             with torch.cuda.stream(stream):
-                expert_list = expert_ids.cpu().tolist()
-                n = len(expert_list)
+                # One blocking-sync event serves every host wait below.
+                # `cudaEventBlockingSync` parks this thread in the OS until the
+                # GPU signals; `stream.synchronize()` would busy-spin the
+                # driver, and each spin poll takes the context lock the main
+                # thread needs for its own kernel launches.
+                pace = torch.cuda.Event(blocking=True)
 
-                # Reference ids are host-side telemetry; bring them over here on
-                # the side stream (off the main thread), where they were produced.
-                # Before `maps_ready`, since `resolve`'s hit accounting reads them
-                # right after that wait.
-                buf.reference_ids = (
-                    None
-                    if reference_ids is None
-                    else reference_ids.detach().cpu().numpy()
-                )
+                # D2H the ids through per-buffer pinned rows. Pageable `.cpu()`
+                # would allocate every prefetch and spin-sync the stream.
+                # Reference ids (host-side telemetry) ride the same wait; they
+                # must be over before `maps_ready`, since `resolve`'s hit
+                # accounting reads them right after that fires.
+                ids_view, ref_view = buf.stage_host_ids(expert_ids, reference_ids)
+                pace.record(stream)
+                pace.synchronize()
+                expert_list = ids_view.tolist()
+                n = len(expert_list)
+                buf.reference_ids = None if ref_view is None else ref_view.numpy()
 
                 # Record the slot<->expert maps on the host, from the ids we
                 # already have on CPU, so `resolve` reads them without any GPU
@@ -1533,4 +1059,3 @@ class ExpertCache:
         start = torch.cuda.Event(enable_timing=True)
         start.record(stream)
         return start, torch.cuda.Event(enable_timing=True)
-

@@ -155,6 +155,8 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             num_cache_slots=expert_cache.num_cache_slots,
             quant_bits=tuple(expert_cache.expert_quant_bits),
             quant_group_size=expert_cache.expert_quant_group_size,
+            worker_mode=expert_cache.prefetch_worker_mode,
+            shm_dir=expert_cache.prefetch_shm_dir,
         )
     elif backend == "prefetch":
         return PrefetchOffloader(

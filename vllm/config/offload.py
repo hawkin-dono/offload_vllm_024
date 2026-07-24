@@ -218,6 +218,31 @@ class ExpertCacheOffloadConfig:
     prefetch_min_topk: int = Field(default=1, ge=1)
     """Floor on the number of experts per token to stage."""
 
+    prefetch_worker_mode: Literal["thread", "process"] = "thread"
+    """Where the prefetch worker runs.
+
+    "thread" (the default) issues the staging copies from a worker thread. That
+    thread shares the interpreter (GIL) and the CUDA context with the model's
+    forward pass, so its Python enqueue work and stream waits contend with the
+    compute thread's own kernel launches.
+
+    "process" runs the worker in a separate process with its own interpreter
+    and CUDA context: the host expert store moves into file-backed shared
+    memory (see `prefetch_shm_dir`) registered by both processes, the GPU cache
+    buffers are shared via CUDA IPC, and readiness crosses over interprocess
+    CUDA events. Linux-only. Costs one extra CUDA context (~a few hundred MB of
+    GPU memory per rank). With `expert_quant_bits` set, the dequant kernels
+    launch from the worker's context; run the CUDA MPS daemon so they share SMs
+    with compute instead of time-slicing against it.
+    """
+
+    prefetch_shm_dir: str = "/dev/shm"
+    """Directory for the shared host weight store's backing files (process
+    mode only). Must be tmpfs/shm-like and large enough for the offloaded
+    expert weights plus the quantized store; the default tmpfs at /dev/shm is
+    typically capped at half of RAM.
+    """
+
 
 @config
 class OffloadConfig:
@@ -294,6 +319,16 @@ class OffloadConfig:
                 stacklevel=2,
             )
 
+        if self.expert_cache.prefetch_worker_mode == "process":
+            import sys
+
+            if not sys.platform.startswith("linux"):
+                raise ValueError(
+                    "prefetch_worker_mode='process' needs Linux: the shared "
+                    "host weight store lives in file-backed shared memory "
+                    "(/dev/shm) and the buffers cross processes via CUDA IPC."
+                )
+
         quant_bits = self.expert_cache.expert_quant_bits
         if quant_bits:
             supported = set(SUPPORTED_EXPERT_QUANT_BITS)
@@ -358,6 +393,11 @@ class OffloadConfig:
                 "prefetch_ema_alpha",
                 "prefetch_min_topk",
                 "prefetch_pin_bits",
+                # Where the worker runs and where the arena's files land never
+                # change the traced graph. (`prefetch_worker_mode` does change
+                # host store placement, but that is invisible to compilation.)
+                "prefetch_worker_mode",
+                "prefetch_shm_dir",
             },
         )
         hash_str = hash_factors(factors)

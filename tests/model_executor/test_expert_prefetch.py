@@ -13,6 +13,7 @@ from vllm.model_executor.layers.expert_prefetch import (
     EMPTY_SLOT,
     maybe_create_expert_cache,
 )
+from vllm.model_executor.layers.expert_prefetch.constants import NATIVE_BITS
 from vllm.model_executor.offloader import create_offloader, get_offloader, set_offloader
 
 pytestmark = pytest.mark.skipif(
@@ -110,8 +111,8 @@ def test_chunking_stages_exactly_what_one_chunk_would(cache_and_moes, num_chunks
     ids = [7, 2, 11, 4, 9, 0, 15]
 
     buf = _staged(cache, moes[1], ids, num_chunks)
-    assert buf.cached_expert_ids[: len(ids)].tolist() == ids
-    assert (buf.cached_expert_ids[len(ids) :] == EMPTY_SLOT).all()
+    assert buf.slot_to_expert[: len(ids)].tolist() == ids
+    assert (buf.slot_to_expert[len(ids) :] == EMPTY_SLOT).all()
     # Layer 1's expert e is filled with 100 + e.
     for slot, expert in enumerate(ids):
         assert buf.params["w13_weight"][slot].unique().tolist() == [100 + expert]
@@ -127,27 +128,33 @@ def test_chunking_preserves_caller_ordering(cache_and_moes):
     cache, moes = cache_and_moes
     ids = [15, 14, 13, 12, 3, 2, 1, 0]
     buf = _staged(cache, moes[0], ids, num_chunks=4)
-    assert buf.cached_expert_ids[: len(ids)].tolist() == ids
+    assert buf.slot_to_expert[: len(ids)].tolist() == ids
 
 
-def test_overflow_truncates_the_tail_and_is_reported(cache_and_moes):
-    """An overflowing prefetch must tell the controller, or it will grow again."""
+def test_overflow_truncates_the_tail(cache_and_moes):
+    """An overflowing prefetch keeps the head of the caller's ranking.
+
+    (The `staged`/`truncated` stats are tallied by `ExpertPrefetcher` on the
+    main thread, not by the cache, so they are out of scope here.)
+    """
     cache, moes = cache_and_moes
     ids = list(range(NUM_EXPERTS + 5))
 
-    assert cache.stats.truncated is False
     buf = _staged(cache, moes[0], ids, num_chunks=4)
 
-    assert cache.stats.truncated is True
-    assert cache.stats.staged == NUM_EXPERTS
     # The survivors are the head of what the caller passed, not the low ids.
-    assert buf.cached_expert_ids.tolist() == ids[:NUM_EXPERTS]
+    assert buf.slot_to_expert.tolist() == ids[:NUM_EXPERTS]
 
 
 def test_stats_count_only_prefetched_layers_and_reset(cache_and_moes):
-    """A dropped buffer is all misses by construction and must not skew `acc`."""
+    """A dropped buffer is all misses by construction and must not skew `acc`.
+
+    Hit accounting only runs on sampled passes, so the forward is opened with
+    `sampling=True`.
+    """
     cache, moes = cache_and_moes
     topk_ids = torch.tensor([[0, 1, 2, 3]], device="cuda")
+    cache.begin_forward(sampling=True)
 
     # Staged for layer 0, but consumed by layer 1: the buffer is dropped.
     _staged(cache, moes[0], [0, 1, 2, 3], num_chunks=2)
@@ -170,6 +177,7 @@ def test_stats_count_only_prefetched_layers_and_reset(cache_and_moes):
 
 def test_stats_see_a_partial_hit(cache_and_moes):
     cache, moes = cache_and_moes
+    cache.begin_forward(sampling=True)
     _staged(cache, moes[0], [0, 1], num_chunks=2)
     cache.flip()
     cache.resolve(moes[0], torch.tensor([[0, 1, 2, 3]], device="cuda"))
@@ -182,9 +190,11 @@ def test_calibration_measures_a_positive_copy_time(cache_and_moes):
     """The bubble constraint divides by this, so it must never be zero."""
     cache, _ = cache_and_moes
     t_e = cache.calibrate_copy_time(num_samples=4, warmup=1)
-    assert t_e > 0.0
+    # {num_bits: ms_per_expert}; quantization is off here, so bf16 only.
+    assert set(t_e) == {NATIVE_BITS}
+    assert t_e[NATIVE_BITS] > 0.0
     # Calibration must not leave the buffer claiming to hold anything.
-    assert (cache.ping.cached_expert_ids == EMPTY_SLOT).all()
+    assert (cache.ping.slot_to_expert == EMPTY_SLOT).all()
     assert cache.ping.staged_for is None
 
 
@@ -203,15 +213,26 @@ def test_worker_exceptions_do_not_hang_the_consumer(cache_and_moes, caplog):
     assert "Expert prefetch failed" in caplog.text
 
 
-def test_inflight_prefetch_is_skipped_not_queued(cache_and_moes):
-    """Queueing behind a pacing worker would start the next prefetch too late."""
+def test_back_to_back_prefetches_serialize_and_last_wins(cache_and_moes):
+    """The single-worker executor serializes overlapping prefetches.
+
+    Two prefetches issued before either completes must run in order, leave the
+    buffer describing the *second* one, and never deadlock the consumer.
+    """
     cache, moes = cache_and_moes
     stream = torch.cuda.Stream()
 
     cache.prefetch(moes[0], torch.tensor([0, 1], device="cuda"), stream)
-    inflight = cache._inflight
     cache.prefetch(moes[1], torch.tensor([2, 3], device="cuda"), stream)
-    # The second call either found the first still running and returned, or the
-    # first had already finished; either way it never queued a third future.
-    assert cache._inflight is inflight or cache._inflight.done()
-    cache.inactive.wait_until_ready()
+    # Barrier: the executor has one worker, so this future completes only
+    # after both queued prefetches have fully run.
+    cache._executor.submit(lambda: None).result()
+    buf = cache.inactive
+    buf.wait_until_ready()
+    torch.cuda.synchronize()
+
+    assert buf.staged_for == moes[1].layer_name
+    assert buf.slot_to_expert[:2].tolist() == [2, 3]
+    # Layer 1's expert e is filled with 100 + e.
+    assert buf.params["w13_weight"][0].unique().tolist() == [102]
+    assert buf.params["w13_weight"][1].unique().tolist() == [103]
